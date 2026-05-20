@@ -256,6 +256,8 @@ This boundary is realized in `src/wolf/safety/prompt_injection.py`: external con
 
 Filesystem operations are bounded by `src/wolf/safety/project_boundary.py` (`ProjectBoundaryGuard`): every project-scoped path must resolve under `project_root`, including through symlinks. Router code must call `ProjectBoundaryGuard.check()` before `SensitivePathGuard.check()` — the boundary guard enforces "inside project", the sensitive guard enforces "not a known secret".
 
+`src/wolf/orchestrator/router.py` (`Router`) is the single entry point that enforces this pipeline order on every action: `ProjectBoundaryGuard` → `SensitivePathGuard` → `PolicyEngine` → `RobotPreflight` (robot actions) → `scan_for_injection_markers` + `quote_untrusted_for_prompt` (`UntrustedText` body) → provider call → `AuditLogger`. Any guard denial, `REQUIRE_CONFIRMATION`, or audit-write failure short-circuits before the provider call; `RouterDecision` and the audit event never carry raw `UntrustedText` content.
+
 ## Expected implementation style
 
 Prefer:
