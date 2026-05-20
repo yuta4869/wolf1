@@ -11,7 +11,10 @@ services:
     volumes:
       - ./src:/app/src:ro
       - ./tests:/app/tests:ro
+      - ./scripts:/app/scripts:ro
+      - ./docs:/app/docs:ro
       - ./pyproject.toml:/app/pyproject.toml:ro
+      - ./CLAUDE.md:/app/CLAUDE.md:ro
       - ./Dockerfile:/app/Dockerfile:ro
       - ./docker-compose.yml:/app/docker-compose.yml:ro
       - ./docker-compose.gpu.yml:/app/docker-compose.gpu.yml:ro
