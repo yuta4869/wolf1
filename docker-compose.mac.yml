@@ -1,0 +1,4 @@
+services:
+  wolf:
+    environment:
+      WOLF_BACKEND: cpu

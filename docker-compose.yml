@@ -1,0 +1,22 @@
+services:
+  wolf:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: wolf:dev
+    working_dir: /app
+    environment:
+      WOLF_ENV: docker
+      WOLF_BACKEND: cpu
+    volumes:
+      - ./src:/app/src:ro
+      - ./tests:/app/tests:ro
+      - ./pyproject.toml:/app/pyproject.toml:ro
+      - ./Dockerfile:/app/Dockerfile:ro
+      - ./docker-compose.yml:/app/docker-compose.yml:ro
+      - ./docker-compose.gpu.yml:/app/docker-compose.gpu.yml:ro
+      - ./docker-compose.mac.yml:/app/docker-compose.mac.yml:ro
+      - ./.dockerignore:/app/.dockerignore:ro
+      - ./.claude/settings.json:/app/.claude/settings.json:ro
+    command: python -m unittest discover -s tests -t . -v
+    network_mode: none

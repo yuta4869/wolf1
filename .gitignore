@@ -1,0 +1,44 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Local secrets (denied by safety/sensitive_paths too)
+.env
+.env.*
+secrets/
+credentials/
+tokens/
+private/
+
+# Runtime data (planned)
+data/
+models/
+vector_db/
+var/
+
+# Claude Code local overrides
+.claude/settings.local.json
