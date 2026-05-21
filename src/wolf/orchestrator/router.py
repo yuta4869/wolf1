@@ -9,6 +9,7 @@ from typing import Any, FrozenSet, List, Mapping, Optional, Tuple, Union
 from ..adapters.llm import LLMAdapter
 from ..adapters.robot_transport import RobotState, RobotTransport
 from ..core.audit import AuditLogger, utc_now_iso
+from ..core.errors import AdapterError
 from ..core.policy import PolicyEngine
 from ..core.types import Action as PolicyAction
 from ..core.types import AuditEvent, Decision, RiskLevel
@@ -306,7 +307,21 @@ class Router:
                     failed_checks=["provider: missing body"],
                     warnings=warnings,
                 )
-            result = self.llm.summarize(text_for_llm)
+            try:
+                result = self.llm.summarize(text_for_llm)
+            except AdapterError as exc:
+                return self._finalize(
+                    action,
+                    allowed=False,
+                    executed=False,
+                    requires_confirmation=False,
+                    reason=f"provider failed: {exc.label}",
+                    stage=STAGE_PROVIDER,
+                    provider_called=True,
+                    result=None,
+                    failed_checks=[f"provider: {exc.label}"],
+                    warnings=warnings,
+                )
             provider_called = True
             executed = True
         elif kind_str in (

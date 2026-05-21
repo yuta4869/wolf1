@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 from typing import Any, List, Mapping, Optional, Sequence
 
+from .adapters.llm import LLMAdapter
 from .core.audit import AuditLogger
 from .core.types import RiskLevel
 from .fakes.llm import FakeLLM
@@ -30,7 +31,12 @@ def _default_audit_path(project_root: Path) -> Path:
     return project_root / "var" / "audit" / DEFAULT_AUDIT_FILE
 
 
-def _build_router(project_root: Path, audit_path: Optional[Path] = None) -> Router:
+def _build_router(
+    project_root: Path,
+    *,
+    audit_path: Optional[Path] = None,
+    llm: Optional[LLMAdapter] = None,
+) -> Router:
     root = project_root.resolve()
     audit_target = (
         audit_path
@@ -38,14 +44,45 @@ def _build_router(project_root: Path, audit_path: Optional[Path] = None) -> Rout
         else _default_audit_path(root)
     )
     audit = AuditLogger(audit_target)
-    llm = FakeLLM()
+    llm_adapter: LLMAdapter = llm if llm is not None else FakeLLM()
     robot = FakeRobotTransport()
     return Router(
         project_root=root,
-        llm=llm,
+        llm=llm_adapter,
         robot_transport=robot,
         audit=audit,
     )
+
+
+def _build_llm_from_args(args: argparse.Namespace) -> LLMAdapter:
+    backend = getattr(args, "backend", "fake")
+    if backend == "fake":
+        return FakeLLM()
+    if backend == "ollama":
+        # Lazy import so importing the CLI does not pull urllib bindings
+        # unless an Ollama backend is actually requested. Also keeps
+        # `python -m wolf.cli summarize-email --backend fake ...` working
+        # even if a future ollama.py refactor breaks something.
+        from .adapters.ollama import (
+            DEFAULT_BASE_URL,
+            OllamaLLMAdapter,
+        )
+
+        model = getattr(args, "model", None)
+        if not model:
+            raise ValueError(
+                "--backend ollama requires --model (e.g. --model llama3.1)"
+            )
+        base_url = getattr(args, "ollama_url", None) or DEFAULT_BASE_URL
+        allow_non_localhost = bool(
+            getattr(args, "allow_non_localhost_ollama", False)
+        )
+        return OllamaLLMAdapter(
+            model=model,
+            base_url=base_url,
+            allow_non_localhost=allow_non_localhost,
+        )
+    raise ValueError(f"unsupported backend: {backend!r}")
 
 
 def _decision_to_safe_dict(
@@ -105,7 +142,12 @@ def _healthy_environment() -> Mapping[str, bool]:
 
 def cmd_summarize_email(args: argparse.Namespace) -> int:
     project_root = Path(args.project_root).resolve()
-    router = _build_router(project_root)
+    try:
+        llm = _build_llm_from_args(args)
+    except ValueError as exc:
+        sys.stderr.write(f"wolf cli: {exc}\n")
+        return EXIT_DENIED
+    router = _build_router(project_root, llm=llm)
     body = wrap_untrusted(args.text, SourceKind.EMAIL)
     action = RouterAction(
         kind=ActionKind.LLM_SUMMARIZE_EMAIL,
@@ -165,9 +207,42 @@ def build_parser() -> argparse.ArgumentParser:
 
     se = sub.add_parser(
         "summarize-email",
-        help="Wrap text as UntrustedText and route through FakeLLM",
+        help=(
+            "Wrap text as UntrustedText and route through the selected "
+            "LLM backend (default: FakeLLM)"
+        ),
     )
     se.add_argument("--text", required=True, help="Email body text")
+    se.add_argument(
+        "--backend",
+        choices=("fake", "ollama"),
+        default="fake",
+        help=(
+            "LLM backend to use. 'fake' uses the in-process FakeLLM. "
+            "'ollama' connects to a locally-running Ollama server."
+        ),
+    )
+    se.add_argument(
+        "--model",
+        default=None,
+        help="Ollama model name (required when --backend ollama)",
+    )
+    se.add_argument(
+        "--ollama-url",
+        default=None,
+        help=(
+            "Ollama server URL (default: http://127.0.0.1:11434). "
+            "Must be localhost unless --allow-non-localhost-ollama is set."
+        ),
+    )
+    se.add_argument(
+        "--allow-non-localhost-ollama",
+        action="store_true",
+        help=(
+            "Explicitly permit a non-localhost --ollama-url. Default is "
+            "to refuse external URLs to prevent accidental cloud calls."
+        ),
+    )
     se.set_defaults(func=cmd_summarize_email)
 
     cp = sub.add_parser(
