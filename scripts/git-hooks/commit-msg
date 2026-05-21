@@ -1,0 +1,51 @@
+#!/bin/sh
+# commit-msg hook for wolf.
+#
+# Git passes the path to the temporary commit message file as $1. We scan
+# that file for forbidden attribution markers and re-check the current git
+# identity. Installed by scripts/install-git-hooks.sh into
+# .git/hooks/commit-msg.
+#
+# Exit code 0 lets the commit proceed; any non-zero exit blocks it and the
+# commit message file is preserved by git for the user to edit.
+
+set -e
+
+commit_msg_file="$1"
+if [ -z "$commit_msg_file" ]; then
+    echo "wolf commit-msg: missing commit message file argument" >&2
+    exit 1
+fi
+if [ ! -f "$commit_msg_file" ]; then
+    echo "wolf commit-msg: commit message file does not exist: $commit_msg_file" >&2
+    exit 1
+fi
+
+repo_root=$(git rev-parse --show-toplevel)
+guard="$repo_root/scripts/check-no-ai-attribution.sh"
+
+if [ ! -x "$guard" ]; then
+    echo "wolf commit-msg: attribution guard not found or not executable:" >&2
+    echo "  expected at $guard" >&2
+    echo "  re-run scripts/install-git-hooks.sh after restoring the file." >&2
+    exit 1
+fi
+
+# 1. Scan the commit message content. Use --text with the file contents so
+# the guard treats it as inline text (not as a path that might be
+# allowlisted). The commit message file is a transient tempfile path
+# anyway, but --text makes the intent explicit.
+msg_content=$(cat "$commit_msg_file")
+if ! "$guard" --text "$msg_content"; then
+    echo "wolf commit-msg: commit message contains forbidden attribution." >&2
+    echo "  rewrite the message and try again. The original message is" >&2
+    echo "  preserved in $commit_msg_file." >&2
+    exit 2
+fi
+
+# 2. Verify git identity at commit-msg time too (some tools edit identity
+# between pre-commit and commit-msg phases).
+if ! "$guard" --identity; then
+    echo "wolf commit-msg: git identity check failed." >&2
+    exit 2
+fi
