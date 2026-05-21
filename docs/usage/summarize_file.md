@@ -73,8 +73,21 @@ PYTHONPATH=src python3 -m wolf.cli summarize-file \
 | `--ollama-url URL` | `http://127.0.0.1:11434` | Ollama server |
 | `--allow-non-localhost-ollama` | off | opt-in for non-localhost URLs |
 | `--max-bytes N` | `1048576` (1 MiB) | refuse to read files above this |
+| `--no-chunk` | off | disable automatic chunking |
+| `--chunk-size N` | `32768` | bytes per chunk when chunking |
+| `--max-chunks N` | `32` | drop remaining chunks past this count (warning surfaces) |
 | `--strict-prompt-injection` | off | block on warning markers too |
 | `--output json|text` | `json` | output format on stdout |
+
+## Chunking
+
+When the file exceeds `--chunk-size`, `summarize-file` splits the body
+on paragraph / line / hard-byte boundaries, summarizes each chunk
+through the Router (so each chunk goes through the prompt-injection
+scan), then summarizes the concatenated per-chunk summaries to produce
+the final output. `--no-chunk` skips this and sends the whole file in
+one LLM call (which may fail on large inputs). Truncation past
+`--max-chunks` is reported in the `warnings` field.
 
 ## Exit codes
 

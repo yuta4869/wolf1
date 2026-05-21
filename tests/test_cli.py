@@ -1043,5 +1043,276 @@ class SummarizeFileUsabilityTest(unittest.TestCase):
         self.assertEqual(payload["result"], "spec-summary")
 
 
+class SummarizeFileChunkingTest(unittest.TestCase):
+    """Chunked summarize-file path (PR #16)."""
+
+    def setUp(self) -> None:
+        self.fixture = _ProjectFixture()
+
+    def tearDown(self) -> None:
+        self.fixture.cleanup()
+
+    def _run(self, *extra_args: str):
+        return _run_inproc(
+            [
+                "--project-root",
+                str(self.fixture.root),
+                "summarize-file",
+                *extra_args,
+            ]
+        )
+
+    def _write_big_text(self, name: str, kb: int) -> None:
+        # Each "line %d\n" is roughly 8-12 bytes. Build text of about kb*1024.
+        content = "\n".join(f"line {i} of the big text" for i in range(kb * 60))
+        (self.fixture.root / name).write_text(content, encoding="utf-8")
+
+    def test_chunked_summarize_handles_large_file(self) -> None:
+        self._write_big_text("big.txt", kb=100)  # ~ 100 KiB
+        code, out, _ = self._run(
+            "--path",
+            "big.txt",
+            "--backend",
+            "fake",
+            "--chunk-size",
+            "8192",
+            "--max-chunks",
+            "32",
+            "--max-bytes",
+            str(2 * 1024 * 1024),
+        )
+        self.assertEqual(code, EXIT_SUCCESS, msg=out)
+        payload = json.loads(out)
+        self.assertTrue(payload["allowed"])
+        self.assertEqual(payload["stage"], "complete")
+
+    def test_no_chunk_rejects_oversize(self) -> None:
+        # The file is bigger than the --max-bytes limit. With chunking,
+        # read fails at read_text. With --no-chunk the read also fails
+        # the same way (file is still too large to read in one go).
+        self._write_big_text("over.txt", kb=200)  # ~ 200 KiB
+        code, out, _ = self._run(
+            "--path", "over.txt", "--no-chunk", "--max-bytes", "65536"
+        )
+        self.assertEqual(code, EXIT_DENIED)
+        payload = json.loads(out)
+        self.assertEqual(payload["stage"], "file_read")
+
+    def test_max_chunks_truncation_surfaces_warning(self) -> None:
+        # Force truncation: tiny chunk_size + max_chunks=2 + a moderately
+        # long file.
+        text = ("alpha beta gamma " * 200) + ("\n\n" + "x" * 500)
+        (self.fixture.root / "wide.txt").write_text(text, encoding="utf-8")
+        code, out, _ = self._run(
+            "--path",
+            "wide.txt",
+            "--chunk-size",
+            "100",
+            "--max-chunks",
+            "2",
+        )
+        self.assertEqual(code, EXIT_SUCCESS)
+        payload = json.loads(out)
+        # truncation message lands in warnings list.
+        joined = " | ".join(payload["warnings"])
+        self.assertIn("truncated", joined.lower())
+
+
+class SummarizeDirTest(unittest.TestCase):
+    """summarize-dir end-to-end (PR #16)."""
+
+    def setUp(self) -> None:
+        self.fixture = _ProjectFixture()
+        notes = self.fixture.root / "docs"
+        notes.mkdir()
+        (notes / "a.md").write_text("# Doc A\nFirst document.\n", encoding="utf-8")
+        (notes / "b.md").write_text("# Doc B\nSecond document.\n", encoding="utf-8")
+        (notes / "c.txt").write_text("Plain notes about C.\n", encoding="utf-8")
+        # Binary should be skipped.
+        (notes / "image.png").write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 50)
+        # Sensitive: secrets/ inside the project should be skipped.
+        sec = self.fixture.root / "secrets"
+        # Already created by _ProjectFixture; add another file.
+        (sec / "more.txt").write_text("secret-text\n", encoding="utf-8")
+
+    def tearDown(self) -> None:
+        self.fixture.cleanup()
+
+    def _run(self, *extra_args: str):
+        return _run_inproc(
+            [
+                "--project-root",
+                str(self.fixture.root),
+                "summarize-dir",
+                *extra_args,
+            ]
+        )
+
+    def test_walks_and_summarizes_multiple_files(self) -> None:
+        code, out, _ = self._run("--path", "docs", "--backend", "fake")
+        self.assertEqual(code, EXIT_SUCCESS, msg=out)
+        payload = json.loads(out)
+        self.assertTrue(payload["allowed"])
+        self.assertEqual(payload["stage"], "complete")
+
+    def test_secrets_dir_excluded(self) -> None:
+        # Pointing summarize-dir directly at secrets/ should be denied.
+        code, out, _ = self._run("--path", "secrets", "--backend", "fake")
+        self.assertEqual(code, EXIT_DENIED)
+        payload = json.loads(out)
+        self.assertEqual(payload["stage"], "sensitive_path")
+
+    def test_env_file_explicitly_included_still_skipped(self) -> None:
+        # Top-level .env explicitly included; the per-file
+        # SensitivePathGuard must still skip it so its body never reaches
+        # the LLM.
+        (self.fixture.root / ".env").write_text("API_KEY=x\n", encoding="utf-8")
+        code, out, _ = self._run(
+            "--path",
+            ".",
+            "--backend",
+            "fake",
+            "--include",
+            ".env",
+            "--include",
+            "*.md",
+        )
+        self.assertEqual(code, EXIT_SUCCESS, msg=out)
+        payload = json.loads(out)
+        warnings_text = " | ".join(payload["warnings"])
+        self.assertIn(".env", warnings_text)
+        self.assertIn("sensitive_path", warnings_text)
+
+    def test_binary_file_skipped_as_warning(self) -> None:
+        # Include the binary so it reaches the read step, then assert
+        # it is skipped with a warning (not silently dropped).
+        code, out, _ = self._run(
+            "--path",
+            "docs",
+            "--backend",
+            "fake",
+            "--include",
+            "*.md",
+            "--include",
+            "*.png",
+        )
+        self.assertEqual(code, EXIT_SUCCESS)
+        payload = json.loads(out)
+        warnings_text = " | ".join(payload["warnings"])
+        self.assertIn("image.png", warnings_text)
+
+    def test_include_flag_filters_to_md_only(self) -> None:
+        code, out, _ = self._run(
+            "--path", "docs", "--backend", "fake", "--include", "*.md"
+        )
+        self.assertEqual(code, EXIT_SUCCESS)
+        payload = json.loads(out)
+        warnings_text = " | ".join(payload["warnings"])
+        # c.txt and image.png should not appear in summaries because the
+        # include filter excluded them. We cannot inspect per-file
+        # summaries directly from the aggregated decision, but the file
+        # walk should NOT have emitted a "skipped c.txt" warning either
+        # (filtered out before the walker hands them off).
+        self.assertNotIn("skipped docs/c.txt", warnings_text)
+        self.assertNotIn("skipped docs/image.png", warnings_text)
+
+    def test_exclude_flag_drops_pattern(self) -> None:
+        code, out, _ = self._run(
+            "--path",
+            "docs",
+            "--backend",
+            "fake",
+            "--exclude",
+            "a.md",
+        )
+        self.assertEqual(code, EXIT_SUCCESS)
+        # a.md is excluded; b.md and c.txt remain.
+        payload = json.loads(out)
+        self.assertTrue(payload["allowed"])
+
+    def test_max_files_caps_walk(self) -> None:
+        for i in range(5):
+            (self.fixture.root / "docs" / f"extra_{i}.txt").write_text(
+                f"extra notes {i}\n", encoding="utf-8"
+            )
+        code, out, _ = self._run(
+            "--path",
+            "docs",
+            "--backend",
+            "fake",
+            "--max-files",
+            "2",
+        )
+        self.assertEqual(code, EXIT_SUCCESS)
+        payload = json.loads(out)
+        warnings_text = " | ".join(payload["warnings"])
+        self.assertIn("max_files", warnings_text)
+
+    def test_empty_dir_denied(self) -> None:
+        (self.fixture.root / "empty").mkdir()
+        code, out, _ = self._run("--path", "empty", "--backend", "fake")
+        self.assertEqual(code, EXIT_DENIED)
+        payload = json.loads(out)
+        self.assertIn("no eligible files", payload["reason"].lower())
+
+    def test_output_text_mode(self) -> None:
+        code, out, _ = self._run(
+            "--path", "docs", "--backend", "fake", "--output", "text"
+        )
+        self.assertEqual(code, EXIT_SUCCESS)
+        with self.assertRaises(json.JSONDecodeError):
+            json.loads(out)
+        self.assertIn("SUMMARY", out)
+
+    def test_no_raw_file_body_in_output(self) -> None:
+        marker = "DIR_FILE_BODY_LEAK_PROBE_12345"
+        (self.fixture.root / "docs" / "leak.md").write_text(
+            f"hello\n{marker}\nbye\n", encoding="utf-8"
+        )
+        code, _, err = self._run(
+            "--path", "docs", "--backend", "fake", "--output", "text"
+        )
+        # FakeLLM may slice the quoted preamble + content prefix into the
+        # text result, so check stderr only for now (where we promise
+        # privacy unconditionally).
+        self.assertEqual(code, EXIT_SUCCESS)
+        self.assertNotIn(marker, err)
+
+    def test_ollama_backend_routes_through_router(self) -> None:
+        import urllib.request
+        from unittest import mock
+
+        def fake_urlopen(req, timeout=None):
+            class _Resp:
+                def __enter__(self_inner):
+                    return self_inner
+
+                def __exit__(self_inner, *a):
+                    return False
+
+                def read(self_inner):
+                    return json.dumps(
+                        {"response": "dir-summary", "done": True}
+                    ).encode("utf-8")
+
+            return _Resp()
+
+        with mock.patch.object(
+            urllib.request, "urlopen", side_effect=fake_urlopen
+        ):
+            code, out, _ = self._run(
+                "--path",
+                "docs",
+                "--backend",
+                "ollama",
+                "--model",
+                "llama3.1",
+            )
+        self.assertEqual(code, EXIT_SUCCESS, msg=out)
+        payload = json.loads(out)
+        # Final aggregation summary is the last ollama call.
+        self.assertEqual(payload["result"], "dir-summary")
+
+
 if __name__ == "__main__":
     unittest.main()

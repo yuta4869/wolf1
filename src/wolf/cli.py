@@ -11,6 +11,11 @@ from .core.audit import AuditLogger
 from .core.types import RiskLevel
 from .fakes.llm import FakeLLM
 from .fakes.robot import FakeRobotTransport
+from .files.chunking import (
+    DEFAULT_CHUNK_SIZE,
+    DEFAULT_MAX_CHUNKS,
+    split_text,
+)
 from .files.read_text import (
     DEFAULT_MAX_BYTES as FILE_DEFAULT_MAX_BYTES,
     FileReadError,
@@ -282,8 +287,53 @@ def cmd_summarize_file(args: argparse.Namespace) -> int:
     # Step 4: wrap the body as UntrustedText (source = local_document) and
     # route through the LLM_SUMMARIZE pipeline. The Router runs the
     # prompt-injection scan and quote-for-prompt step before the adapter.
+    # Step 4: optionally split the body into chunks and summarize each,
+    # then summarize the joined chunk summaries. The Router still runs
+    # the prompt-injection scan and quote step on every UntrustedText.
+    no_chunk = bool(getattr(args, "no_chunk", False))
+    chunk_size = int(getattr(args, "chunk_size", DEFAULT_CHUNK_SIZE))
+    max_chunks = int(getattr(args, "max_chunks", DEFAULT_MAX_CHUNKS))
+
+    text_for_summary: Optional[str] = None
+    chunk_warnings: List[str] = []
+
+    if no_chunk or read_result.byte_size <= chunk_size:
+        text_for_summary = read_result.text
+    else:
+        split = split_text(
+            read_result.text,
+            chunk_size=chunk_size,
+            max_chunks=max_chunks,
+        )
+        if split.truncated:
+            chunk_warnings.append(
+                f"chunking: truncated after {len(split.chunks)} chunks "
+                f"(file > chunk_size * max_chunks)"
+            )
+        per_chunk_summaries: List[str] = []
+        for idx, chunk in enumerate(split.chunks):
+            decision = _summarize_chunk_via_router(
+                router=router,
+                text=chunk,
+                source_ref=f"{target_path}:chunk-{idx + 1}",
+                byte_size=len(chunk.encode("utf-8")),
+                encoding=read_result.encoding,
+            )
+            if not decision.allowed or not isinstance(decision.result, str):
+                return _emit_decision(
+                    decision,
+                    output_mode=output_mode,
+                    include_result=False,
+                )
+            per_chunk_summaries.append(decision.result)
+            chunk_warnings.extend(decision.warnings)
+        text_for_summary = "\n\n".join(
+            f"--- chunk {i + 1} of {len(per_chunk_summaries)} ---\n{s}"
+            for i, s in enumerate(per_chunk_summaries)
+        )
+
     body = wrap_untrusted(
-        read_result.text,
+        text_for_summary,
         SourceKind.LOCAL_DOCUMENT,
         source_ref=str(target_path),
         metadata={
@@ -297,11 +347,270 @@ def cmd_summarize_file(args: argparse.Namespace) -> int:
         body=body,
     )
     decision = router.route(summarize_action)
+    if chunk_warnings:
+        decision = _decision_with_extra_warnings(decision, chunk_warnings)
     return _emit_decision(
         decision,
         output_mode=output_mode,
         include_result=True,
     )
+
+
+def _summarize_chunk_via_router(
+    *,
+    router: Router,
+    text: str,
+    source_ref: str,
+    byte_size: int,
+    encoding: str,
+) -> RouterDecision:
+    body = wrap_untrusted(
+        text,
+        SourceKind.LOCAL_DOCUMENT,
+        source_ref=source_ref,
+        metadata={"byte_size": str(byte_size), "encoding": encoding},
+    )
+    action = RouterAction(
+        kind=ActionKind.LLM_SUMMARIZE,
+        risk_level=RiskLevel.LOW,
+        body=body,
+    )
+    return router.route(action)
+
+
+def _decision_with_extra_warnings(
+    decision: RouterDecision, extra: Sequence[str]
+) -> RouterDecision:
+    if not extra:
+        return decision
+    return RouterDecision(
+        allowed=decision.allowed,
+        executed=decision.executed,
+        requires_confirmation=decision.requires_confirmation,
+        reason=decision.reason,
+        stage=decision.stage,
+        audit_event_id=decision.audit_event_id,
+        provider_called=decision.provider_called,
+        result=decision.result,
+        failed_checks=decision.failed_checks,
+        warnings=tuple(list(decision.warnings) + list(extra)),
+    )
+
+
+DEFAULT_DIR_INCLUDE_EXTS = (".txt", ".md", ".rst", ".py")
+DEFAULT_DIR_MAX_FILES = 50
+DEFAULT_DIR_MAX_TOTAL_BYTES = 2 * 1024 * 1024  # 2 MiB
+
+
+def _fnmatch_any(name: str, patterns: Sequence[str]) -> bool:
+    import fnmatch
+
+    return any(fnmatch.fnmatch(name, p) for p in patterns)
+
+
+def _iter_candidate_files(
+    *,
+    root: Path,
+    recursive: bool,
+    include: Sequence[str],
+    exclude: Sequence[str],
+) -> List[Path]:
+    out: List[Path] = []
+    if not root.exists() or not root.is_dir():
+        return out
+    if recursive:
+        walker = root.rglob("*")
+    else:
+        walker = root.glob("*")
+    for p in walker:
+        if not p.is_file():
+            continue
+        rel = str(p.relative_to(root))
+        if include and not _fnmatch_any(rel, include) and not _fnmatch_any(
+            p.name, include
+        ):
+            continue
+        if exclude and (
+            _fnmatch_any(rel, exclude) or _fnmatch_any(p.name, exclude)
+        ):
+            continue
+        out.append(p)
+    out.sort()
+    return out
+
+
+def cmd_summarize_dir(args: argparse.Namespace) -> int:
+    project_root = Path(args.project_root).resolve()
+    output_mode = getattr(args, "output", "json")
+    strict = bool(getattr(args, "strict_prompt_injection", False))
+
+    try:
+        llm = _build_llm_from_args(args)
+    except ValueError as exc:
+        sys.stderr.write(f"wolf cli: {exc}\n")
+        return EXIT_DENIED
+
+    router = _build_router(
+        project_root,
+        llm=llm,
+        config=RouterConfig(allow_warning_injection_findings=not strict),
+    )
+
+    # Step 1: gate the directory path. We route a FILE_READ action so
+    # ProjectBoundary + SensitivePath run; if the directory itself is
+    # outside or sensitive, deny immediately.
+    gate = router.route(
+        RouterAction(
+            kind=ActionKind.FILE_READ,
+            risk_level=RiskLevel.LOW,
+            target_path=args.path,
+        )
+    )
+    if not gate.allowed:
+        return _emit_decision(gate, output_mode=output_mode, include_result=False)
+
+    # Step 2: resolve and walk the directory.
+    target_dir = Path(args.path)
+    if not target_dir.is_absolute():
+        target_dir = (project_root / target_dir).resolve()
+    if not target_dir.is_dir():
+        payload = {
+            "allowed": False,
+            "executed": False,
+            "requires_confirmation": False,
+            "stage": "file_read",
+            "reason": f"file_read failed: not a directory",
+            "provider_called": False,
+            "audit_event_id": gate.audit_event_id,
+            "failed_checks": ["file_read: not a directory"],
+            "warnings": [],
+        }
+        if output_mode == "text":
+            sys.stderr.write("wolf cli: file_read failed: not a directory\n")
+        else:
+            _print_json(payload)
+        return EXIT_DENIED
+
+    recursive = not bool(getattr(args, "no_recursive", False))
+    include = tuple(getattr(args, "include", None) or [])
+    if not include:
+        include = tuple(f"*{ext}" for ext in DEFAULT_DIR_INCLUDE_EXTS)
+    exclude = tuple(getattr(args, "exclude", None) or [])
+    max_files = int(getattr(args, "max_files", DEFAULT_DIR_MAX_FILES))
+    max_total_bytes = int(
+        getattr(args, "max_total_bytes", DEFAULT_DIR_MAX_TOTAL_BYTES)
+    )
+    max_bytes_per_file = int(
+        getattr(args, "max_bytes", FILE_DEFAULT_MAX_BYTES)
+    )
+
+    candidates = _iter_candidate_files(
+        root=target_dir,
+        recursive=recursive,
+        include=include,
+        exclude=exclude,
+    )
+
+    # Step 3: per-file summarize. Each file goes through the Router's
+    # full pipeline (boundary + sensitive + injection scan + provider).
+    per_file_summaries: List[str] = []
+    warnings: List[str] = []
+    accepted_count = 0
+    bytes_seen = 0
+
+    for candidate in candidates:
+        if accepted_count >= max_files:
+            warnings.append(
+                f"dir: stopped at max_files={max_files}; remaining files skipped"
+            )
+            break
+        rel = candidate.relative_to(project_root)
+        # Per-file boundary + sensitive check via Router.
+        file_gate = router.route(
+            RouterAction(
+                kind=ActionKind.FILE_READ,
+                risk_level=RiskLevel.LOW,
+                target_path=str(candidate),
+            )
+        )
+        if not file_gate.allowed:
+            warnings.append(
+                f"dir: skipped {rel} (stage={file_gate.stage})"
+            )
+            continue
+        try:
+            read_result = read_text_file(
+                candidate, max_bytes=max_bytes_per_file
+            )
+        except FileReadError as exc:
+            warnings.append(f"dir: skipped {rel} (file_read: {exc.label})")
+            continue
+        if bytes_seen + read_result.byte_size > max_total_bytes:
+            warnings.append(
+                f"dir: skipped {rel} (max_total_bytes={max_total_bytes} reached)"
+            )
+            continue
+        # Summarize the file content (no chunking inside the dir walker;
+        # callers pick smaller files or use summarize-file for per-file
+        # chunking).
+        decision = _summarize_chunk_via_router(
+            router=router,
+            text=read_result.text,
+            source_ref=str(candidate),
+            byte_size=read_result.byte_size,
+            encoding=read_result.encoding,
+        )
+        if not decision.allowed or not isinstance(decision.result, str):
+            warnings.append(
+                f"dir: skipped {rel} (stage={decision.stage})"
+            )
+            continue
+        per_file_summaries.append(f"[{rel}]\n{decision.result}")
+        warnings.extend(decision.warnings)
+        bytes_seen += read_result.byte_size
+        accepted_count += 1
+
+    if accepted_count == 0:
+        payload = {
+            "allowed": False,
+            "executed": False,
+            "requires_confirmation": False,
+            "stage": "file_read",
+            "reason": "no eligible files found",
+            "provider_called": False,
+            "audit_event_id": gate.audit_event_id,
+            "failed_checks": ["dir: no eligible files"],
+            "warnings": warnings,
+        }
+        if output_mode == "text":
+            sys.stderr.write("wolf cli: no eligible files found\n")
+        else:
+            _print_json(payload)
+        return EXIT_DENIED
+
+    # Step 4: aggregate per-file summaries into a final summary via the
+    # Router so the Ollama/Fake backend produces a single consolidated
+    # output and the audit log records one final action.
+    aggregated_text = "\n\n".join(per_file_summaries)
+    body = wrap_untrusted(
+        aggregated_text,
+        SourceKind.LOCAL_DOCUMENT,
+        source_ref=f"dir:{target_dir}",
+        metadata={
+            "files": str(accepted_count),
+            "bytes_total": str(bytes_seen),
+        },
+    )
+    final = router.route(
+        RouterAction(
+            kind=ActionKind.LLM_SUMMARIZE,
+            risk_level=RiskLevel.LOW,
+            body=body,
+        )
+    )
+    if warnings:
+        final = _decision_with_extra_warnings(final, warnings)
+    return _emit_decision(final, output_mode=output_mode, include_result=True)
 
 
 def cmd_check_path(args: argparse.Namespace) -> int:
@@ -451,7 +760,115 @@ def build_parser() -> argparse.ArgumentParser:
             "content-free reason."
         ),
     )
+    sf.add_argument(
+        "--no-chunk",
+        action="store_true",
+        help=(
+            "Disable automatic chunking; pass the full file body to the "
+            "LLM in a single call (default: chunking is enabled when the "
+            "file exceeds --chunk-size)."
+        ),
+    )
+    sf.add_argument(
+        "--chunk-size",
+        type=int,
+        default=DEFAULT_CHUNK_SIZE,
+        help=(
+            "Chunk size in bytes for chunked summarize "
+            f"(default: {DEFAULT_CHUNK_SIZE})."
+        ),
+    )
+    sf.add_argument(
+        "--max-chunks",
+        type=int,
+        default=DEFAULT_MAX_CHUNKS,
+        help=(
+            "Maximum number of chunks to summarize; remaining chunks are "
+            f"dropped with a warning (default: {DEFAULT_MAX_CHUNKS})."
+        ),
+    )
     sf.set_defaults(func=cmd_summarize_file)
+
+    sd = sub.add_parser(
+        "summarize-dir",
+        help=(
+            "Walk a project-local directory, summarize each eligible "
+            "text file, then summarize the aggregated per-file summaries"
+        ),
+    )
+    sd.add_argument(
+        "--path",
+        required=True,
+        help="Directory path (relative paths resolve against --project-root)",
+    )
+    sd.add_argument(
+        "--backend",
+        choices=("fake", "ollama"),
+        default="fake",
+        help="LLM backend to use (default: fake)",
+    )
+    sd.add_argument("--model", default=None, help="Ollama model name")
+    sd.add_argument("--ollama-url", default=None, help="Ollama server URL")
+    sd.add_argument(
+        "--allow-non-localhost-ollama",
+        action="store_true",
+        help="Permit a non-localhost --ollama-url",
+    )
+    sd.add_argument(
+        "--no-recursive",
+        action="store_true",
+        help="Only consider files directly under --path",
+    )
+    sd.add_argument(
+        "--include",
+        action="append",
+        default=None,
+        help=(
+            "fnmatch pattern to include (relative to --path); may be "
+            "repeated. Default: *.txt, *.md, *.rst, *.py"
+        ),
+    )
+    sd.add_argument(
+        "--exclude",
+        action="append",
+        default=None,
+        help=(
+            "fnmatch pattern to exclude (relative to --path); may be repeated"
+        ),
+    )
+    sd.add_argument(
+        "--max-files",
+        type=int,
+        default=DEFAULT_DIR_MAX_FILES,
+        help=f"Maximum files to summarize (default: {DEFAULT_DIR_MAX_FILES})",
+    )
+    sd.add_argument(
+        "--max-total-bytes",
+        type=int,
+        default=DEFAULT_DIR_MAX_TOTAL_BYTES,
+        help=(
+            "Cumulative read budget in bytes; further files are skipped "
+            f"(default: {DEFAULT_DIR_MAX_TOTAL_BYTES})"
+        ),
+    )
+    sd.add_argument(
+        "--max-bytes",
+        type=int,
+        default=FILE_DEFAULT_MAX_BYTES,
+        help="Per-file size limit (default: 1 MiB)",
+    )
+    sd.add_argument(
+        "--strict-prompt-injection",
+        action="store_true",
+        help="Block on warning markers in addition to critical markers",
+    )
+    sd.add_argument(
+        "--output",
+        choices=("json", "text"),
+        default="json",
+        help="Output format (default: json)",
+    )
+    sd.set_defaults(func=cmd_summarize_dir)
 
     cp = sub.add_parser(
         "check-path",
