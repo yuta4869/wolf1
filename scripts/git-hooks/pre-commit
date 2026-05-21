@@ -1,0 +1,35 @@
+#!/bin/sh
+# pre-commit hook for wolf.
+#
+# Runs the attribution guard against the staged content and the current
+# git identity. Installed by scripts/install-git-hooks.sh into
+# .git/hooks/pre-commit. The hook is opt-in: it is not active until
+# install-git-hooks.sh has been run by the developer.
+#
+# Exit code 0 lets the commit proceed; any non-zero exit blocks it.
+
+set -e
+
+repo_root=$(git rev-parse --show-toplevel)
+guard="$repo_root/scripts/check-no-ai-attribution.sh"
+
+if [ ! -x "$guard" ]; then
+    echo "wolf pre-commit: attribution guard not found or not executable:" >&2
+    echo "  expected at $guard" >&2
+    echo "  re-run scripts/install-git-hooks.sh after restoring the file." >&2
+    exit 1
+fi
+
+# 1. Scan staged content.
+if ! "$guard" --staged; then
+    echo "wolf pre-commit: staged content contains forbidden attribution." >&2
+    echo "  fix the listed files and re-stage before committing." >&2
+    exit 2
+fi
+
+# 2. Verify git identity.
+if ! "$guard" --identity; then
+    echo "wolf pre-commit: git identity check failed." >&2
+    echo "  set git config user.name / user.email to a human identity." >&2
+    exit 2
+fi

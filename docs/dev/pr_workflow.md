@@ -101,11 +101,48 @@ Exit codes:
 
 The guard is a tripwire, not a proof of human authorship.
 
-## Future hardening (out of scope for PR #9)
+## Opt-in local git hooks (PR #10)
 
-- A `pre-commit` hook calling `scripts/check-no-ai-attribution.sh --staged`
-  and `--commit HEAD` on the local machine.
+`scripts/install-git-hooks.sh` is an opt-in installer that copies two hooks
+into the developer's `.git/hooks/` directory:
+
+- `pre-commit` runs `scripts/check-no-ai-attribution.sh --staged` and
+  `--identity`. Any forbidden marker in staged content or any AI / bot
+  identity blocks the commit.
+- `commit-msg` is given the commit message tempfile by git. It runs
+  `--text` on the message contents and `--identity` again. Any forbidden
+  marker in the message itself blocks the commit; git preserves the
+  message file so the user can edit and retry.
+
+Install:
+
+```sh
+scripts/install-git-hooks.sh             # install if no conflict
+scripts/install-git-hooks.sh --dry-run   # show what would happen
+scripts/install-git-hooks.sh --force     # overwrite existing hooks (backup as .bak)
+```
+
+The installer refuses to overwrite an existing non-identical hook unless
+`--force` is given. With `--force` it copies the previous file to
+`<hook>.bak` first so nothing is silently destroyed. Re-installing the
+same byte-identical hook is a no-op.
+
+The hooks themselves are at `scripts/git-hooks/pre-commit` and
+`scripts/git-hooks/commit-msg`; they look up the repo root via
+`git rev-parse --show-toplevel` and call the attribution guard via
+absolute path, so they continue to work after `cd` into subdirectories.
+If the guard script is missing or non-executable, the hook fails with a
+clear error.
+
+This is opt-in, not enforced by CI. The CI-level enforcement is the
+follow-up GitHub Actions PR (see "Future hardening" below).
+
+## Future hardening (out of scope for PR #10)
+
 - A GitHub Actions workflow running the guard against the PR head ref and
-  the PR body via `gh api`.
+  the PR body via `gh api`. This closes the gap where a PR body is edited
+  in the web UI after push, or where a developer skips the local install.
 - A regex extension to catch `🤖 (generated|wrote|made)` etc. once we see
   paraphrases in the wild.
+- A `--all` mode that scans every tracked file in the repo (not just
+  staged), for use during one-off audits of the existing history.

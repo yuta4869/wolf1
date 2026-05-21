@@ -52,7 +52,8 @@ anthropic'
 ALLOWLIST='CLAUDE.md
 docs/dev/pr_workflow.md
 scripts/check-no-ai-attribution.sh
-tests/test_no_ai_attribution.py'
+tests/test_no_ai_attribution.py
+tests/test_git_hooks.py'
 
 usage() {
     cat >&2 <<'EOF'
