@@ -114,6 +114,9 @@ class DefaultComposeTest(unittest.TestCase):
             r"\./docker-compose\.mac\.yml:/app/docker-compose\.mac\.yml:ro",
             r"\./\.dockerignore:/app/\.dockerignore:ro",
             r"\./\.claude/settings\.json:/app/\.claude/settings\.json:ro",
+            r"\./scripts:/app/scripts:ro",
+            r"\./docs:/app/docs:ro",
+            r"\./CLAUDE\.md:/app/CLAUDE\.md:ro",
         )
         for pattern in required:
             self.assertRegex(self.content, pattern)
