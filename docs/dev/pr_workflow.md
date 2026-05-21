@@ -137,16 +137,18 @@ clear error.
 This is opt-in, not enforced by CI. The CI-level enforcement is the
 follow-up GitHub Actions PR (see "Future hardening" below).
 
-## CI-level enforcement: GitHub Actions (PR #11)
+## CI-level enforcement: GitHub Actions (PR #11, hardened in PR #12)
 
-`.github/workflows/no-attribution.yml` runs the guard on every pull request
-and every push. It is the CI guard layer that closes the gap when a
-developer has not run `scripts/install-git-hooks.sh` or edits the PR body
-in the GitHub web UI after pushing.
+`.github/workflows/no-attribution.yml` runs the guard on every pull
+request and every push. It is the CI guard layer that closes the gap
+when a developer has not run `scripts/install-git-hooks.sh` or edits the
+PR body in the GitHub web UI after pushing.
 
 Workflow contract:
 
-- Triggers on `pull_request` and `push`.
+- Triggers: `pull_request` (types: `opened`, `synchronize`, `reopened`,
+  `edited`) and `push`. The `edited` type is what causes a re-scan when
+  the PR title or body is changed after the initial push.
 - Permissions: `contents: read`, `pull-requests: read`. No write scopes.
 - Steps:
   1. `actions/checkout@v4` with `fetch-depth: 2`.
@@ -160,15 +162,39 @@ Workflow contract:
   references, no `api.github.com` HTTP requests. The workflow only reads
   the event payload that GitHub already provides on disk.
 
+PR body edits: when a reviewer (or the author) edits the PR body via the
+GitHub web UI, GitHub fires a `pull_request` event with `action: edited`.
+Because the `edited` type is listed under `pull_request.types`, the
+workflow re-runs and the body extraction step receives the new body text.
+A `Co-Authored-By` trailer added post-push is therefore caught on the
+re-scan rather than slipping past the initial run.
+
 If the PR body is empty, the workflow writes an empty file and the guard
 returns exit 0 (no markers). The empty case is logged explicitly so a
 reviewer can confirm the scan happened.
 
 The workflow is best-effort: it catches the most common attribution
-mistakes but does not replace human PR review. It is also not a substitute
-for the local hooks (PR #10) — the two layers are complementary.
+mistakes but does not replace human PR review. It is also **not** a
+substitute for the local hooks (PR #10) — the two layers are
+complementary. The local hooks give feedback before the commit lands;
+the CI gate is the final review-time enforcement.
 
-## Future hardening (out of scope for PR #11)
+### Activation note (default branch)
+
+Until the workflow file is present on the repository's default branch
+(`main`), GitHub Actions only runs it on commits in branches where the
+file already exists. That means:
+
+- During PRs #11 / #12 themselves, the CI guard runs because the file
+  exists on those PR branches.
+- For unrelated PRs opened before PR #11 lands on `main`, the workflow
+  has no effect.
+
+The first cross-cutting verification happens on the **next PR opened
+after PR #11 merges to `main`**. See `docs/dev/ci_first_run.md` for the
+verification runbook.
+
+## Future hardening (out of scope for PR #12)
 
 - A regex extension to catch `🤖 (generated|wrote|made)` etc. once we see
   paraphrases in the wild.
@@ -176,3 +202,4 @@ for the local hooks (PR #10) — the two layers are complementary.
   staged), for use during one-off audits of the existing history.
 - A `scripts/uninstall-git-hooks.sh` symmetric with the installer, to
   remove the hooks and optionally restore the `.bak` backup.
+- Pin `actions/checkout` to a specific commit SHA rather than `@v4`.

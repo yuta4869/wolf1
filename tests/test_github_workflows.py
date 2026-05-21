@@ -42,6 +42,35 @@ class TriggersTest(unittest.TestCase):
     def test_has_pull_request_trigger(self) -> None:
         self.assertRegex(self.content, r"(?m)^\s*pull_request\s*:")
 
+    def test_pull_request_declares_types_list(self) -> None:
+        # PR #12 hardening: pull_request must enumerate types so 'edited'
+        # is included (otherwise GitHub defaults to
+        # opened / synchronize / reopened only and PR body edits go unscanned).
+        self.assertRegex(self.content, r"(?ms)pull_request\s*:\s*\n\s*types\s*:")
+
+    def _pull_request_types(self) -> list:
+        # Extract the indented block under "pull_request:" -> "types:".
+        m = re.search(
+            r"(?ms)pull_request\s*:\s*\n\s*types\s*:\s*\n((?:\s*-\s*\w+\s*\n)+)",
+            self.content,
+        )
+        if not m:
+            return []
+        return re.findall(r"-\s*(\w+)", m.group(1))
+
+    def test_pull_request_types_includes_opened(self) -> None:
+        self.assertIn("opened", self._pull_request_types())
+
+    def test_pull_request_types_includes_synchronize(self) -> None:
+        self.assertIn("synchronize", self._pull_request_types())
+
+    def test_pull_request_types_includes_reopened(self) -> None:
+        self.assertIn("reopened", self._pull_request_types())
+
+    def test_pull_request_types_includes_edited(self) -> None:
+        # PR #12 hardening: PR body edits must trigger a re-scan.
+        self.assertIn("edited", self._pull_request_types())
+
     def test_has_push_trigger(self) -> None:
         self.assertRegex(self.content, r"(?m)^\s*push\s*:")
 
@@ -179,6 +208,56 @@ class DocsCrossReferenceTest(unittest.TestCase):
             f"pr_workflow.md must describe the CI guard layer "
             f"(found {markers_seen} relevant markers)",
         )
+
+    def test_pr_workflow_doc_mentions_edited_event_rescan(self) -> None:
+        # PR #12 hardening: doc must explain that PR body edits trigger
+        # a re-scan via the edited event type.
+        body = _read(DOCS_PR_WORKFLOW).lower()
+        self.assertIn("edited", body)
+        # The doc should describe what happens on a PR body edit, not just
+        # contain the literal word "edited" by accident.
+        self.assertTrue(
+            "re-scan" in body or "rescan" in body or "re-run" in body,
+            "pr_workflow.md must describe the re-scan behavior on edit",
+        )
+
+
+CI_FIRST_RUN_DOC = REPO_ROOT / "docs" / "dev" / "ci_first_run.md"
+
+
+class CiFirstRunDocTest(unittest.TestCase):
+    """PR #12 hardening: a verification runbook for the first CI execution."""
+
+    def test_doc_exists(self) -> None:
+        self.assertTrue(
+            CI_FIRST_RUN_DOC.is_file(),
+            f"missing {CI_FIRST_RUN_DOC}",
+        )
+
+    def test_doc_names_the_check(self) -> None:
+        body = _read(CI_FIRST_RUN_DOC)
+        # The doc should reference the workflow / job names so a human
+        # knows which Check to look for in the GitHub UI.
+        self.assertIn("No attribution guard", body)
+
+    def test_doc_describes_success_signal(self) -> None:
+        body = _read(CI_FIRST_RUN_DOC).lower()
+        # Some marker indicating "what success looks like".
+        self.assertTrue(
+            "success" in body or "green" in body or "pass" in body,
+            "ci_first_run.md must describe the success signal",
+        )
+
+    def test_doc_describes_failure_investigation(self) -> None:
+        body = _read(CI_FIRST_RUN_DOC).lower()
+        self.assertTrue(
+            "fail" in body or "log" in body or "red" in body,
+            "ci_first_run.md must describe failure investigation",
+        )
+
+    def test_doc_mentions_pr_body_scan_verification(self) -> None:
+        body = _read(CI_FIRST_RUN_DOC).lower()
+        self.assertIn("pr body", body)
 
 
 if __name__ == "__main__":
