@@ -13,9 +13,17 @@ no file deletion, no move, no overwrite. The full safety pipeline runs:
    default 1 MiB size limit, rejects files with NUL bytes or a high
    non-text byte ratio, and requires valid UTF-8 (configurable).
 4. The decoded text is wrapped in `UntrustedText` (source kind
-   `local_document`) and routed through `PromptInjectionShield`.
+   `local_document`) and routed through `PromptInjectionShield`. For
+   `summarize-file` the default is to surface warning-level markers
+   (e.g., the words "robot" or "send email" in a project doc) as
+   warnings without blocking, since most project documents legitimately
+   mention these words. Critical markers (e.g., "ignore previous
+   instructions") still block. Pass `--strict-prompt-injection` to
+   block on warnings too. `summarize-email` retains the stricter
+   default — emails are far more likely to be actual injection vectors.
 5. The Router calls the selected LLM backend (`fake` by default,
-   `ollama` opt-in) and returns a `RouterDecision` JSON to stdout.
+   `ollama` opt-in) and returns a `RouterDecision` JSON to stdout, or a
+   plain-text summary if `--output text` is set.
 
 The raw file content never appears in stderr or in the
 `RouterDecision` JSON fields `failed_checks` / `warnings` / `stage` /
@@ -41,7 +49,32 @@ PYTHONPATH=src python3 -m wolf.cli summarize-file \
 PYTHONPATH=src python3 -m wolf.cli summarize-file \
     --path ./notes/meeting.txt \
     --max-bytes 65536
+
+# Plain-text output: just the summary on stdout, errors on stderr.
+PYTHONPATH=src python3 -m wolf.cli summarize-file \
+    --path ./notes/meeting.txt \
+    --output text
+
+# Strict prompt-injection mode: warning markers block in addition to
+# critical markers. Use for files of unknown provenance (e.g., a doc a
+# colleague handed you).
+PYTHONPATH=src python3 -m wolf.cli summarize-file \
+    --path ./untrusted/notes.txt \
+    --strict-prompt-injection
 ```
+
+## Flags
+
+| flag | default | description |
+| --- | --- | --- |
+| `--path PATH` | required | file to read |
+| `--backend fake|ollama` | `fake` | LLM backend |
+| `--model NAME` | required for ollama | Ollama model name |
+| `--ollama-url URL` | `http://127.0.0.1:11434` | Ollama server |
+| `--allow-non-localhost-ollama` | off | opt-in for non-localhost URLs |
+| `--max-bytes N` | `1048576` (1 MiB) | refuse to read files above this |
+| `--strict-prompt-injection` | off | block on warning markers too |
+| `--output json|text` | `json` | output format on stdout |
 
 ## Exit codes
 
@@ -68,9 +101,19 @@ PYTHONPATH=src python3 -m wolf.cli summarize-file \
 
 - The file is opened in binary mode and never logged. Audit records
   carry the byte size, encoding, and source path — never the bytes.
-- A file containing prompt-injection markers (e.g., `"ignore previous
-  instructions"`) is blocked at the `prompt_injection` stage and the
-  LLM is NOT called.
+- A file containing **critical** prompt-injection markers (e.g.,
+  `"ignore previous instructions"`) is blocked at the `prompt_injection`
+  stage and the LLM is NOT called. This is unchanged by
+  `--strict-prompt-injection`.
+- **Warning-level** markers (e.g., literal mentions of `robot`,
+  `send email`, `sudo`) are surfaced in the `warnings` field by default
+  but do NOT block. Pass `--strict-prompt-injection` to convert them
+  back to blocking, matching the PR #14 behavior and the
+  `summarize-email` default.
+- `--output text` is convenient for piping, but failure messages still
+  go to stderr and never include the file body. A warning count line
+  may appear on stderr when warnings are present; the actual marker
+  list lives in the `--output json` payload.
 - The Ollama backend refuses non-localhost URLs unless
   `--allow-non-localhost-ollama` is set explicitly. The Fake backend
   has no network surface.

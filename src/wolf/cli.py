@@ -20,6 +20,7 @@ from .orchestrator.router import (
     ActionKind,
     Router,
     RouterAction,
+    RouterConfig,
     RouterDecision,
 )
 from .safety.prompt_injection import SourceKind, wrap_untrusted
@@ -41,6 +42,7 @@ def _build_router(
     *,
     audit_path: Optional[Path] = None,
     llm: Optional[LLMAdapter] = None,
+    config: Optional[RouterConfig] = None,
 ) -> Router:
     root = project_root.resolve()
     audit_target = (
@@ -56,6 +58,7 @@ def _build_router(
         llm=llm_adapter,
         robot_transport=robot,
         audit=audit,
+        config=config,
     )
 
 
@@ -165,8 +168,64 @@ def cmd_summarize_email(args: argparse.Namespace) -> int:
     return _exit_code_for(decision)
 
 
+def _emit_file_read_failure(
+    *,
+    label: str,
+    gate_decision: RouterDecision,
+    output_mode: str,
+) -> int:
+    payload = {
+        "allowed": False,
+        "executed": False,
+        "requires_confirmation": False,
+        "stage": "file_read",
+        "reason": f"file_read failed: {label}",
+        "provider_called": False,
+        "audit_event_id": gate_decision.audit_event_id,
+        "failed_checks": [f"file_read: {label}"],
+        "warnings": [],
+    }
+    if output_mode == "text":
+        sys.stderr.write(f"wolf cli: file_read failed: {label}\n")
+    else:
+        _print_json(payload)
+    return EXIT_DENIED
+
+
+def _emit_decision(
+    decision: RouterDecision,
+    *,
+    output_mode: str,
+    include_result: bool,
+) -> int:
+    if output_mode == "text":
+        if decision.allowed and decision.executed and isinstance(
+            decision.result, str
+        ):
+            sys.stdout.write(decision.result)
+            if not decision.result.endswith("\n"):
+                sys.stdout.write("\n")
+            if decision.warnings:
+                sys.stderr.write(
+                    f"wolf cli: {len(decision.warnings)} warning(s) "
+                    f"during summarize (see --output json for details)\n"
+                )
+            return EXIT_SUCCESS
+        sys.stderr.write(
+            f"wolf cli: stage={decision.stage} "
+            f"reason={decision.reason}\n"
+        )
+        return _exit_code_for(decision)
+    # Default: json
+    payload = _decision_to_safe_dict(decision, include_result=include_result)
+    _print_json(payload)
+    return _exit_code_for(decision)
+
+
 def cmd_summarize_file(args: argparse.Namespace) -> int:
     project_root = Path(args.project_root).resolve()
+    output_mode = getattr(args, "output", "json")
+    strict = bool(getattr(args, "strict_prompt_injection", False))
 
     # Step 1: build the LLM backend up front so a misconfigured Ollama
     # backend (missing --model, external URL without --allow-non-localhost)
@@ -177,7 +236,16 @@ def cmd_summarize_file(args: argparse.Namespace) -> int:
         sys.stderr.write(f"wolf cli: {exc}\n")
         return EXIT_DENIED
 
-    router = _build_router(project_root, llm=llm)
+    # For local files, the default policy is to surface warning-level
+    # injection markers as warnings rather than blocking — most project
+    # documents mention words like "robot" or "send email" without being
+    # actual prompt injections. Critical markers ("ignore previous
+    # instructions" etc.) still block. --strict-prompt-injection flips
+    # this back to PR #14 behavior (warnings block too).
+    router_config = RouterConfig(
+        allow_warning_injection_findings=not strict
+    )
+    router = _build_router(project_root, llm=llm, config=router_config)
 
     # Step 2: gate the path through ProjectBoundary + SensitivePath via a
     # FILE_READ action. This emits an audit event for the path-check
@@ -189,9 +257,11 @@ def cmd_summarize_file(args: argparse.Namespace) -> int:
     )
     gate_decision = router.route(gate_action)
     if not gate_decision.allowed:
-        payload = _decision_to_safe_dict(gate_decision, include_result=False)
-        _print_json(payload)
-        return _exit_code_for(gate_decision)
+        return _emit_decision(
+            gate_decision,
+            output_mode=output_mode,
+            include_result=False,
+        )
 
     # Step 3: read the file safely. Failures are reported as a JSON
     # RouterDecision-shaped payload so the schema stays stable; we do not
@@ -203,27 +273,15 @@ def cmd_summarize_file(args: argparse.Namespace) -> int:
     try:
         read_result = read_text_file(target_path, max_bytes=max_bytes)
     except FileReadError as exc:
-        # Synthesize a RouterDecision-like envelope. We do NOT route this
-        # through the Router because the path already passed the boundary
-        # check and the error is local.
-        payload = {
-            "allowed": False,
-            "executed": False,
-            "requires_confirmation": False,
-            "stage": "file_read",
-            "reason": f"file_read failed: {exc.label}",
-            "provider_called": False,
-            "audit_event_id": gate_decision.audit_event_id,
-            "failed_checks": [f"file_read: {exc.label}"],
-            "warnings": [],
-        }
-        _print_json(payload)
-        return EXIT_DENIED
+        return _emit_file_read_failure(
+            label=exc.label,
+            gate_decision=gate_decision,
+            output_mode=output_mode,
+        )
 
     # Step 4: wrap the body as UntrustedText (source = local_document) and
-    # route through the LLM_SUMMARIZE pipeline. The Router will run the
-    # prompt-injection scan and quote-for-prompt step before calling the
-    # adapter.
+    # route through the LLM_SUMMARIZE pipeline. The Router runs the
+    # prompt-injection scan and quote-for-prompt step before the adapter.
     body = wrap_untrusted(
         read_result.text,
         SourceKind.LOCAL_DOCUMENT,
@@ -239,9 +297,11 @@ def cmd_summarize_file(args: argparse.Namespace) -> int:
         body=body,
     )
     decision = router.route(summarize_action)
-    payload = _decision_to_safe_dict(decision, include_result=True)
-    _print_json(payload)
-    return _exit_code_for(decision)
+    return _emit_decision(
+        decision,
+        output_mode=output_mode,
+        include_result=True,
+    )
 
 
 def cmd_check_path(args: argparse.Namespace) -> int:
@@ -369,6 +429,26 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Maximum file size in bytes (default: 1 MiB). Larger files "
             "are rejected without reading."
+        ),
+    )
+    sf.add_argument(
+        "--strict-prompt-injection",
+        action="store_true",
+        help=(
+            "Treat warning-level prompt-injection markers as denials "
+            "(default: warnings are surfaced but do not block). "
+            "Critical markers always block regardless of this flag."
+        ),
+    )
+    sf.add_argument(
+        "--output",
+        choices=("json", "text"),
+        default="json",
+        help=(
+            "Output format. 'json' (default) emits the safe "
+            "RouterDecision schema to stdout. 'text' emits the summary "
+            "only on success; failures go to stderr with a short, "
+            "content-free reason."
         ),
     )
     sf.set_defaults(func=cmd_summarize_file)
