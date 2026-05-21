@@ -137,12 +137,42 @@ clear error.
 This is opt-in, not enforced by CI. The CI-level enforcement is the
 follow-up GitHub Actions PR (see "Future hardening" below).
 
-## Future hardening (out of scope for PR #10)
+## CI-level enforcement: GitHub Actions (PR #11)
 
-- A GitHub Actions workflow running the guard against the PR head ref and
-  the PR body via `gh api`. This closes the gap where a PR body is edited
-  in the web UI after push, or where a developer skips the local install.
+`.github/workflows/no-attribution.yml` runs the guard on every pull request
+and every push. It is the CI guard layer that closes the gap when a
+developer has not run `scripts/install-git-hooks.sh` or edits the PR body
+in the GitHub web UI after pushing.
+
+Workflow contract:
+
+- Triggers on `pull_request` and `push`.
+- Permissions: `contents: read`, `pull-requests: read`. No write scopes.
+- Steps:
+  1. `actions/checkout@v4` with `fetch-depth: 2`.
+  2. Make the guard executable.
+  3. `scripts/check-no-ai-attribution.sh --commit HEAD`.
+  4. `scripts/check-no-ai-attribution.sh --identity`.
+  5. On `pull_request` only: read `$GITHUB_EVENT_PATH` with Python stdlib,
+     extract `pull_request.body`, write it to a temp file, and run
+     `scripts/check-no-ai-attribution.sh --file <tempfile>`.
+- No `curl`, no `wget`, no `gh` CLI calls, no `${{ secrets.* }}`
+  references, no `api.github.com` HTTP requests. The workflow only reads
+  the event payload that GitHub already provides on disk.
+
+If the PR body is empty, the workflow writes an empty file and the guard
+returns exit 0 (no markers). The empty case is logged explicitly so a
+reviewer can confirm the scan happened.
+
+The workflow is best-effort: it catches the most common attribution
+mistakes but does not replace human PR review. It is also not a substitute
+for the local hooks (PR #10) — the two layers are complementary.
+
+## Future hardening (out of scope for PR #11)
+
 - A regex extension to catch `🤖 (generated|wrote|made)` etc. once we see
   paraphrases in the wild.
 - A `--all` mode that scans every tracked file in the repo (not just
   staged), for use during one-off audits of the existing history.
+- A `scripts/uninstall-git-hooks.sh` symmetric with the installer, to
+  remove the hooks and optionally restore the `.bak` backup.

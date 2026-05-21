@@ -13,6 +13,7 @@ services:
       - ./tests:/app/tests:ro
       - ./scripts:/app/scripts:ro
       - ./docs:/app/docs:ro
+      - ./.github:/app/.github:ro
       - ./pyproject.toml:/app/pyproject.toml:ro
       - ./CLAUDE.md:/app/CLAUDE.md:ro
       - ./Dockerfile:/app/Dockerfile:ro
