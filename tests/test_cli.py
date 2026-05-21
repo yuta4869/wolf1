@@ -392,6 +392,190 @@ class NetworkIsolationTest(unittest.TestCase):
         self.assertEqual(calls, [])
 
 
+class SummarizeFileTest(unittest.TestCase):
+    """In-process tests for `wolf.cli summarize-file`."""
+
+    def setUp(self) -> None:
+        self.fixture = _ProjectFixture()
+        # Add a clean text file the tests can summarize successfully.
+        (self.fixture.root / "notes").mkdir()
+        (self.fixture.root / "notes" / "meeting.txt").write_text(
+            "Q3 plan: ship the local LLM adapter.\n"
+            "Next checkpoint: end of month.\n",
+            encoding="utf-8",
+        )
+
+    def tearDown(self) -> None:
+        self.fixture.cleanup()
+
+    def _run(self, *extra_args: str):
+        return _run_inproc(
+            [
+                "--project-root",
+                str(self.fixture.root),
+                "summarize-file",
+                *extra_args,
+            ]
+        )
+
+    def test_fake_backend_succeeds_on_clean_file(self) -> None:
+        code, out, _ = self._run("--path", "notes/meeting.txt")
+        self.assertEqual(code, EXIT_SUCCESS)
+        payload = json.loads(out)
+        self.assertTrue(payload["allowed"])
+        self.assertTrue(payload["executed"])
+        self.assertTrue(payload["provider_called"])
+        self.assertEqual(payload["stage"], "complete")
+
+    def test_outside_project_root_denied_at_boundary(self) -> None:
+        code, out, _ = self._run("--path", "/etc/passwd")
+        self.assertEqual(code, EXIT_DENIED)
+        payload = json.loads(out)
+        self.assertEqual(payload["stage"], "project_boundary")
+        self.assertFalse(payload["allowed"])
+
+    def test_secrets_path_denied_at_sensitive(self) -> None:
+        code, out, _ = self._run(
+            "--path", str(self.fixture.root / "secrets" / "key.pem")
+        )
+        self.assertEqual(code, EXIT_DENIED)
+        payload = json.loads(out)
+        self.assertEqual(payload["stage"], "sensitive_path")
+
+    def test_env_file_denied(self) -> None:
+        (self.fixture.root / ".env").write_text("API_KEY=x\n", encoding="utf-8")
+        code, out, _ = self._run("--path", ".env")
+        self.assertEqual(code, EXIT_DENIED)
+        payload = json.loads(out)
+        self.assertEqual(payload["stage"], "sensitive_path")
+
+    def test_missing_file_fails_after_boundary(self) -> None:
+        code, out, _ = self._run("--path", "notes/does_not_exist.txt")
+        self.assertEqual(code, EXIT_DENIED)
+        payload = json.loads(out)
+        self.assertEqual(payload["stage"], "file_read")
+        self.assertIn("not found", payload["reason"].lower())
+
+    def test_directory_path_fails(self) -> None:
+        code, out, _ = self._run("--path", "notes")
+        self.assertEqual(code, EXIT_DENIED)
+        payload = json.loads(out)
+        self.assertEqual(payload["stage"], "file_read")
+
+    def test_binary_file_rejected(self) -> None:
+        (self.fixture.root / "blob.bin").write_bytes(b"head\x00\x00body")
+        code, out, _ = self._run("--path", "blob.bin")
+        self.assertEqual(code, EXIT_DENIED)
+        payload = json.loads(out)
+        self.assertEqual(payload["stage"], "file_read")
+        self.assertIn("binary", payload["reason"].lower())
+
+    def test_oversize_file_rejected(self) -> None:
+        (self.fixture.root / "big.txt").write_text("x" * 5000, encoding="utf-8")
+        code, out, _ = self._run(
+            "--path", "big.txt", "--max-bytes", "100"
+        )
+        self.assertEqual(code, EXIT_DENIED)
+        payload = json.loads(out)
+        self.assertEqual(payload["stage"], "file_read")
+        self.assertIn("exceeds", payload["reason"].lower())
+
+    def test_decode_error_rejected(self) -> None:
+        # Invalid UTF-8 — also looks binary-ish, both outcomes are safe.
+        (self.fixture.root / "bad.txt").write_bytes(b"hello \xff\xfe oops")
+        code, out, _ = self._run("--path", "bad.txt")
+        self.assertEqual(code, EXIT_DENIED)
+        payload = json.loads(out)
+        self.assertEqual(payload["stage"], "file_read")
+
+    def test_file_body_not_in_router_decision_repr(self) -> None:
+        marker = "FILE_BODY_LEAK_PROBE_77_77_77"
+        (self.fixture.root / "notes" / "leak.txt").write_text(
+            f"line A\n{marker}\nline C\n", encoding="utf-8"
+        )
+        code, out, err = self._run("--path", "notes/leak.txt")
+        # FakeLLM echoes a slice of the QUOTED text, so the marker MAY
+        # appear in result if it falls inside the slice window. But the
+        # decision's failed_checks / warnings / stage / reason fields
+        # must never contain the raw marker.
+        payload = json.loads(out)
+        for field in ("failed_checks", "warnings", "stage", "reason"):
+            value = payload.get(field)
+            self.assertNotIn(
+                marker,
+                str(value),
+                f"{field} unexpectedly contains the file body marker",
+            )
+        # stderr is reserved for error explanations; should not include the body.
+        self.assertNotIn(marker, err)
+
+    def test_ollama_backend_missing_model_fails(self) -> None:
+        code, out, err = self._run(
+            "--path", "notes/meeting.txt", "--backend", "ollama"
+        )
+        self.assertEqual(code, EXIT_DENIED)
+        self.assertIn("model", err.lower())
+        # Failed before routing; no JSON body emitted.
+        self.assertEqual(out, "")
+
+    def test_ollama_backend_routes_through_router(self) -> None:
+        import urllib.request
+        from unittest import mock
+
+        def fake_urlopen(req, timeout=None):
+            class _Resp:
+                def __enter__(self_inner):
+                    return self_inner
+
+                def __exit__(self_inner, *a):
+                    return False
+
+                def read(self_inner):
+                    return json.dumps(
+                        {"response": "ollama-file-summary", "done": True}
+                    ).encode("utf-8")
+
+            return _Resp()
+
+        with mock.patch.object(
+            urllib.request, "urlopen", side_effect=fake_urlopen
+        ):
+            code, out, _ = self._run(
+                "--path",
+                "notes/meeting.txt",
+                "--backend",
+                "ollama",
+                "--model",
+                "llama3.1",
+            )
+        self.assertEqual(code, EXIT_SUCCESS)
+        payload = json.loads(out)
+        self.assertEqual(payload["result"], "ollama-file-summary")
+
+    def test_ollama_backend_unreachable_safe_failure(self) -> None:
+        import urllib.error
+        import urllib.request
+        from unittest import mock
+
+        with mock.patch.object(
+            urllib.request,
+            "urlopen",
+            side_effect=urllib.error.URLError("Connection refused"),
+        ):
+            code, out, _ = self._run(
+                "--path",
+                "notes/meeting.txt",
+                "--backend",
+                "ollama",
+                "--model",
+                "llama3.1",
+            )
+        self.assertEqual(code, EXIT_DENIED)
+        payload = json.loads(out)
+        self.assertEqual(payload["stage"], "provider")
+        self.assertFalse(payload["allowed"])
+
+
 class OllamaBackendTest(unittest.TestCase):
     """In-process CLI tests for --backend ollama.
 

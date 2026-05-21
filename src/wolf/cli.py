@@ -11,6 +11,11 @@ from .core.audit import AuditLogger
 from .core.types import RiskLevel
 from .fakes.llm import FakeLLM
 from .fakes.robot import FakeRobotTransport
+from .files.read_text import (
+    DEFAULT_MAX_BYTES as FILE_DEFAULT_MAX_BYTES,
+    FileReadError,
+    read_text_file,
+)
 from .orchestrator.router import (
     ActionKind,
     Router,
@@ -160,6 +165,85 @@ def cmd_summarize_email(args: argparse.Namespace) -> int:
     return _exit_code_for(decision)
 
 
+def cmd_summarize_file(args: argparse.Namespace) -> int:
+    project_root = Path(args.project_root).resolve()
+
+    # Step 1: build the LLM backend up front so a misconfigured Ollama
+    # backend (missing --model, external URL without --allow-non-localhost)
+    # fails fast before any filesystem activity.
+    try:
+        llm = _build_llm_from_args(args)
+    except ValueError as exc:
+        sys.stderr.write(f"wolf cli: {exc}\n")
+        return EXIT_DENIED
+
+    router = _build_router(project_root, llm=llm)
+
+    # Step 2: gate the path through ProjectBoundary + SensitivePath via a
+    # FILE_READ action. This emits an audit event for the path-check
+    # outcome regardless of whether we go on to read the file.
+    gate_action = RouterAction(
+        kind=ActionKind.FILE_READ,
+        risk_level=RiskLevel.LOW,
+        target_path=args.path,
+    )
+    gate_decision = router.route(gate_action)
+    if not gate_decision.allowed:
+        payload = _decision_to_safe_dict(gate_decision, include_result=False)
+        _print_json(payload)
+        return _exit_code_for(gate_decision)
+
+    # Step 3: read the file safely. Failures are reported as a JSON
+    # RouterDecision-shaped payload so the schema stays stable; we do not
+    # echo the raw file content anywhere.
+    target_path = Path(args.path)
+    if not target_path.is_absolute():
+        target_path = (project_root / target_path).resolve()
+    max_bytes = int(getattr(args, "max_bytes", FILE_DEFAULT_MAX_BYTES))
+    try:
+        read_result = read_text_file(target_path, max_bytes=max_bytes)
+    except FileReadError as exc:
+        # Synthesize a RouterDecision-like envelope. We do NOT route this
+        # through the Router because the path already passed the boundary
+        # check and the error is local.
+        payload = {
+            "allowed": False,
+            "executed": False,
+            "requires_confirmation": False,
+            "stage": "file_read",
+            "reason": f"file_read failed: {exc.label}",
+            "provider_called": False,
+            "audit_event_id": gate_decision.audit_event_id,
+            "failed_checks": [f"file_read: {exc.label}"],
+            "warnings": [],
+        }
+        _print_json(payload)
+        return EXIT_DENIED
+
+    # Step 4: wrap the body as UntrustedText (source = local_document) and
+    # route through the LLM_SUMMARIZE pipeline. The Router will run the
+    # prompt-injection scan and quote-for-prompt step before calling the
+    # adapter.
+    body = wrap_untrusted(
+        read_result.text,
+        SourceKind.LOCAL_DOCUMENT,
+        source_ref=str(target_path),
+        metadata={
+            "byte_size": str(read_result.byte_size),
+            "encoding": read_result.encoding,
+        },
+    )
+    summarize_action = RouterAction(
+        kind=ActionKind.LLM_SUMMARIZE,
+        risk_level=RiskLevel.LOW,
+        body=body,
+    )
+    decision = router.route(summarize_action)
+    payload = _decision_to_safe_dict(decision, include_result=True)
+    _print_json(payload)
+    return _exit_code_for(decision)
+
+
 def cmd_check_path(args: argparse.Namespace) -> int:
     project_root = Path(args.project_root).resolve()
     router = _build_router(project_root)
@@ -244,6 +328,50 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     se.set_defaults(func=cmd_summarize_email)
+
+    sf = sub.add_parser(
+        "summarize-file",
+        help=(
+            "Read a project-local text file (boundary + sensitive checked) "
+            "and summarize via the selected LLM backend"
+        ),
+    )
+    sf.add_argument(
+        "--path",
+        required=True,
+        help="File path to read (relative paths resolve against --project-root)",
+    )
+    sf.add_argument(
+        "--backend",
+        choices=("fake", "ollama"),
+        default="fake",
+        help="LLM backend to use (default: fake)",
+    )
+    sf.add_argument(
+        "--model",
+        default=None,
+        help="Ollama model name (required when --backend ollama)",
+    )
+    sf.add_argument(
+        "--ollama-url",
+        default=None,
+        help="Ollama server URL (default: http://127.0.0.1:11434)",
+    )
+    sf.add_argument(
+        "--allow-non-localhost-ollama",
+        action="store_true",
+        help="Explicitly permit a non-localhost --ollama-url",
+    )
+    sf.add_argument(
+        "--max-bytes",
+        type=int,
+        default=FILE_DEFAULT_MAX_BYTES,
+        help=(
+            "Maximum file size in bytes (default: 1 MiB). Larger files "
+            "are rejected without reading."
+        ),
+    )
+    sf.set_defaults(func=cmd_summarize_file)
 
     cp = sub.add_parser(
         "check-path",
