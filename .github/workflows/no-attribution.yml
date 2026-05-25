@@ -1,0 +1,74 @@
+name: No attribution guard
+
+on:
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - edited
+  push:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Show repo context
+        run: |
+          echo "event_name=${GITHUB_EVENT_NAME}"
+          echo "ref=${GITHUB_REF}"
+          echo "sha=${GITHUB_SHA}"
+          git log -1 --pretty=oneline
+
+      - name: Make guard executable
+        run: chmod +x scripts/check-no-ai-attribution.sh
+
+      - name: Scan HEAD commit (message + identity)
+        run: scripts/check-no-ai-attribution.sh --commit HEAD
+
+      - name: Scan current git identity
+        run: scripts/check-no-ai-attribution.sh --identity
+
+      - name: Extract PR body to a temp file (pull_request only)
+        if: github.event_name == 'pull_request'
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+
+          event_path = os.environ.get("GITHUB_EVENT_PATH")
+          if not event_path or not os.path.isfile(event_path):
+              print("no event payload available; skipping PR body scan")
+              sys.exit(0)
+          with open(event_path, "r", encoding="utf-8") as f:
+              event = json.load(f)
+          pr = event.get("pull_request") or {}
+          body = pr.get("body")
+          out = "/tmp/wolf-ci-pr-body.txt"
+          if body is None or body == "":
+              print("PR body is empty; writing empty file for guard")
+              body = ""
+          with open(out, "w", encoding="utf-8") as f:
+              f.write(body)
+          print(f"wrote PR body ({len(body)} chars) to {out}")
+          PY
+
+      - name: Scan PR body (pull_request only)
+        if: github.event_name == 'pull_request'
+        run: |
+          if [ -f /tmp/wolf-ci-pr-body.txt ]; then
+            scripts/check-no-ai-attribution.sh --file /tmp/wolf-ci-pr-body.txt
+          else
+            echo "PR body file not produced; failing closed"
+            exit 1
+          fi

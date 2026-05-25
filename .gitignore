@@ -39,6 +39,7 @@ data/
 models/
 vector_db/
 var/
+.wolf/
 
 # Claude Code local overrides
 .claude/settings.local.json
