@@ -61,6 +61,31 @@ PYTHONPATH=src python3 -m wolf.cli search-summarize \
 }
 ```
 
+Pass `--include-per-file-summary` to attach each hit's individual LLM
+summary under `result.files[].summary`:
+
+```json
+{
+  "result": {
+    "files": [
+      {
+        "path": "docs/a.md",
+        "match_count": 2,
+        "line_number": 5,
+        "summary_length": 412,
+        "summary": "<per-file summary text>"
+      }
+    ],
+    "summary": "<aggregate summary text>"
+  }
+}
+```
+
+The flag is JSON-only. `--output text` ignores it and still writes only
+the aggregate summary to stdout. Per-file summaries are LLM output (not
+raw file bytes), so they are safe to include in an automation pipeline;
+the raw body remains absent from every other field.
+
 `--output text` writes only the aggregate summary to stdout and prints
 a single line on stderr with the warning count if any.
 

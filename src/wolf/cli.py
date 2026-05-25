@@ -1016,6 +1016,9 @@ def cmd_search_summarize(args: argparse.Namespace) -> int:
     # Step 2: search.
     limit = int(getattr(args, "limit", 5))
     max_files = int(getattr(args, "max_files", 5))
+    include_per_file_summary = bool(
+        getattr(args, "include_per_file_summary", False)
+    )
     hits = search_index(
         index,
         query,
@@ -1093,14 +1096,15 @@ def cmd_search_summarize(args: argparse.Namespace) -> int:
             continue
         per_file_summaries.append(f"[{hit.path}]\n{decision.result}")
         warnings.extend(decision.warnings)
-        file_records.append(
-            {
-                "path": hit.path,
-                "match_count": hit.match_count,
-                "line_number": hit.line_number,
-                "summary_length": len(decision.result),
-            }
-        )
+        record = {
+            "path": hit.path,
+            "match_count": hit.match_count,
+            "line_number": hit.line_number,
+            "summary_length": len(decision.result),
+        }
+        if include_per_file_summary:
+            record["summary"] = decision.result
+        file_records.append(record)
         accepted += 1
 
     if accepted == 0:
@@ -1650,6 +1654,15 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("json", "text"),
         default="json",
         help="Output format (default: json)",
+    )
+    ss.add_argument(
+        "--include-per-file-summary",
+        action="store_true",
+        help=(
+            "JSON-only: attach each hit's summary text under "
+            "result.files[].summary. Default omits per-file summaries "
+            "to keep the payload small. Text output ignores this flag."
+        ),
     )
     ss.set_defaults(func=cmd_search_summarize)
 
