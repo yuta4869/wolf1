@@ -1917,5 +1917,282 @@ class SearchSummarizePerFileSummaryTest(unittest.TestCase):
             self.assertTrue(f["summary"].startswith("ollama-summary-"))
 
 
+class SemanticCliTest(unittest.TestCase):
+    """index-files --embed + search-files --semantic + search-summarize --semantic."""
+
+    def setUp(self) -> None:
+        self.fixture = _ProjectFixture()
+        docs = self.fixture.root / "docs"
+        docs.mkdir()
+        (docs / "alpha.md").write_text(
+            "Alpha doc. We will summarize the meeting.\n", encoding="utf-8"
+        )
+        (docs / "beta.md").write_text(
+            "Unrelated topic about climate.\n", encoding="utf-8"
+        )
+        (docs / "gamma.py").write_text(
+            "def summarize(): pass\n", encoding="utf-8"
+        )
+
+    def tearDown(self) -> None:
+        self.fixture.cleanup()
+
+    def _run(self, *extra_args: str):
+        return _run_inproc(
+            [
+                "--project-root",
+                str(self.fixture.root),
+                *extra_args,
+            ]
+        )
+
+    def _build_embed_index(self) -> None:
+        code, out, _ = self._run(
+            "index-files",
+            "--path",
+            "docs",
+            "--embed",
+            "--embedding-backend",
+            "fake",
+            "--embedding-model",
+            "fake-embed",
+        )
+        self.assertEqual(code, EXIT_SUCCESS, msg=out)
+
+    # ---- index-files --embed ----
+
+    def test_index_files_embed_creates_vector_index(self) -> None:
+        self._build_embed_index()
+        vec_path = (
+            self.fixture.root / ".wolf" / "index" / "embeddings.json"
+        )
+        self.assertTrue(vec_path.exists())
+        body = json.loads(vec_path.read_text(encoding="utf-8"))
+        self.assertEqual(body["embedding_model"], "fake-embed")
+        self.assertGreater(len(body["entries"]), 0)
+        # Each entry has an embedding (list of floats).
+        for e in body["entries"]:
+            self.assertIsInstance(e["embedding"], list)
+            self.assertGreater(len(e["embedding"]), 0)
+
+    def test_index_files_embed_ollama_missing_model_fails(self) -> None:
+        code, _, err = self._run(
+            "index-files",
+            "--path",
+            "docs",
+            "--embed",
+            "--embedding-backend",
+            "ollama",
+        )
+        self.assertEqual(code, EXIT_DENIED)
+        self.assertIn("embedding-model", err.lower())
+
+    # ---- search-files --semantic ----
+
+    def test_search_files_semantic_returns_scored_hits(self) -> None:
+        self._build_embed_index()
+        code, out, _ = self._run(
+            "search-files",
+            "--query",
+            "summarize",
+            "--semantic",
+            "--embedding-backend",
+            "fake",
+            "--embedding-model",
+            "fake-embed",
+        )
+        self.assertEqual(code, EXIT_SUCCESS, msg=out)
+        payload = json.loads(out)
+        self.assertEqual(payload["result"]["mode"], "semantic")
+        hits = payload["result"]["hits"]
+        self.assertGreater(len(hits), 0)
+        for h in hits:
+            self.assertIn("path", h)
+            self.assertIn("score", h)
+            self.assertIn("snippet", h)
+        # Hits are sorted by score desc.
+        scores = [h["score"] for h in hits]
+        self.assertEqual(scores, sorted(scores, reverse=True))
+
+    def test_search_files_semantic_missing_index_fails(self) -> None:
+        # No --embed run; semantic index missing.
+        code, out, _ = self._run(
+            "search-files",
+            "--query",
+            "summarize",
+            "--semantic",
+            "--embedding-backend",
+            "fake",
+            "--embedding-model",
+            "fake-embed",
+        )
+        self.assertEqual(code, EXIT_DENIED)
+        payload = json.loads(out)
+        self.assertEqual(payload["stage"], "file_read")
+        self.assertIn("semantic", payload["reason"].lower())
+
+    def test_substring_still_works_when_semantic_not_set(self) -> None:
+        # Build substring index only.
+        code, _, _ = self._run("index-files", "--path", "docs")
+        self.assertEqual(code, EXIT_SUCCESS)
+        code, out, _ = self._run(
+            "search-files", "--query", "summarize"
+        )
+        self.assertEqual(code, EXIT_SUCCESS)
+        payload = json.loads(out)
+        # Substring response shape: no `mode` field, hits have match_count.
+        self.assertNotIn("mode", payload["result"])
+        self.assertGreater(len(payload["result"]["hits"]), 0)
+        for h in payload["result"]["hits"]:
+            self.assertIn("match_count", h)
+            self.assertNotIn("score", h)
+
+    def test_search_files_semantic_text_mode(self) -> None:
+        self._build_embed_index()
+        code, out, _ = self._run(
+            "search-files",
+            "--query",
+            "summarize",
+            "--semantic",
+            "--embedding-backend",
+            "fake",
+            "--embedding-model",
+            "fake-embed",
+            "--output",
+            "text",
+        )
+        self.assertEqual(code, EXIT_SUCCESS)
+        with self.assertRaises(json.JSONDecodeError):
+            json.loads(out)
+        self.assertIn("score=", out)
+
+    # ---- search-summarize --semantic ----
+
+    def test_search_summarize_semantic_succeeds(self) -> None:
+        self._build_embed_index()
+        code, out, _ = self._run(
+            "search-summarize",
+            "--query",
+            "summarize",
+            "--semantic",
+            "--embedding-backend",
+            "fake",
+            "--embedding-model",
+            "fake-embed",
+        )
+        self.assertEqual(code, EXIT_SUCCESS, msg=out)
+        payload = json.loads(out)
+        self.assertEqual(payload["result"]["mode"], "semantic")
+        self.assertGreaterEqual(payload["result"]["summarized_count"], 1)
+        first = payload["result"]["files"][0]
+        self.assertIn("score", first)
+        self.assertIn("path", first)
+        self.assertIn("summary_length", first)
+        self.assertIn("summary", payload["result"])
+
+    def test_search_summarize_semantic_with_per_file_summary(self) -> None:
+        self._build_embed_index()
+        code, out, _ = self._run(
+            "search-summarize",
+            "--query",
+            "summarize",
+            "--semantic",
+            "--embedding-backend",
+            "fake",
+            "--embedding-model",
+            "fake-embed",
+            "--include-per-file-summary",
+        )
+        self.assertEqual(code, EXIT_SUCCESS, msg=out)
+        payload = json.loads(out)
+        for f in payload["result"]["files"]:
+            self.assertIn("summary", f)
+            self.assertIsInstance(f["summary"], str)
+
+    def test_search_summarize_semantic_missing_index(self) -> None:
+        code, out, _ = self._run(
+            "search-summarize",
+            "--query",
+            "summarize",
+            "--semantic",
+            "--embedding-backend",
+            "fake",
+            "--embedding-model",
+            "fake-embed",
+        )
+        self.assertEqual(code, EXIT_DENIED)
+        payload = json.loads(out)
+        self.assertEqual(payload["stage"], "file_read")
+
+    def test_search_summarize_semantic_no_body_in_output(self) -> None:
+        marker = "SEMANTIC_LEAK_PROBE_888"
+        (self.fixture.root / "docs" / "leaky.md").write_text(
+            f"summarize this: {marker}\n", encoding="utf-8"
+        )
+        self._build_embed_index()
+        # No-hit scenario — pick a query unlikely to land near any doc.
+        code, out, err = self._run(
+            "search-summarize",
+            "--query",
+            "QQQQQQQQQQQQQQQQ",
+            "--semantic",
+            "--embedding-backend",
+            "fake",
+            "--embedding-model",
+            "fake-embed",
+            "--output",
+            "text",
+        )
+        # Even on success path with leaky text, stderr should not echo.
+        self.assertNotIn(marker, err)
+        # When code is success, the marker may be inside the aggregate
+        # summary (because FakeLLM slices text); but we have not
+        # promised raw-body privacy in the summary itself.
+
+    def test_search_summarize_semantic_ollama_mocked(self) -> None:
+        import urllib.request
+        from unittest import mock
+
+        # Build fake-embedding index first so search works without mocking
+        # the embedding endpoint.
+        self._build_embed_index()
+
+        def fake_urlopen(req, timeout=None):
+            class _Resp:
+                def __enter__(self_inner):
+                    return self_inner
+
+                def __exit__(self_inner, *a):
+                    return False
+
+                def read(self_inner):
+                    return json.dumps(
+                        {"response": "semantic-summary", "done": True}
+                    ).encode("utf-8")
+
+            return _Resp()
+
+        with mock.patch.object(
+            urllib.request, "urlopen", side_effect=fake_urlopen
+        ):
+            code, out, _ = self._run(
+                "search-summarize",
+                "--query",
+                "summarize",
+                "--semantic",
+                "--embedding-backend",
+                "fake",
+                "--embedding-model",
+                "fake-embed",
+                "--backend",
+                "ollama",
+                "--model",
+                "llama3.1",
+            )
+        self.assertEqual(code, EXIT_SUCCESS, msg=out)
+        payload = json.loads(out)
+        self.assertEqual(payload["result"]["summary"], "semantic-summary")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -8,6 +8,7 @@ from typing import Any, List, Mapping, Optional, Sequence
 
 from .adapters.llm import LLMAdapter
 from .core.audit import AuditLogger
+from .core.errors import AdapterError
 from .core.types import RiskLevel
 from .fakes.llm import FakeLLM
 from .fakes.robot import FakeRobotTransport
@@ -34,6 +35,18 @@ from .files.search import (
     DEFAULT_MAX_HITS as SEARCH_DEFAULT_MAX_HITS,
     SearchHit,
     search as search_index,
+)
+from .files.semantic_search import (
+    DEFAULT_MAX_HITS as SEMANTIC_DEFAULT_MAX_HITS,
+    SemanticHit,
+    search_semantic,
+)
+from .files.vector_index import (
+    VectorEntry,
+    VectorIndex,
+    default_vector_index_path,
+    load_vector_index_json,
+    save_vector_index_json,
 )
 from .orchestrator.router import (
     ActionKind,
@@ -110,6 +123,43 @@ def _build_llm_from_args(args: argparse.Namespace) -> LLMAdapter:
             allow_non_localhost=allow_non_localhost,
         )
     raise ValueError(f"unsupported backend: {backend!r}")
+
+
+def _build_embedder_from_args(args: argparse.Namespace):
+    """Build an EmbeddingAdapter. Mirrors _build_llm_from_args.
+
+    For 'fake' backend, returns a FakeEmbeddingAdapter; for 'ollama',
+    returns an OllamaEmbeddingAdapter. Raises ValueError on misconfig.
+    """
+    backend = getattr(args, "embedding_backend", "ollama") or "ollama"
+    model = getattr(args, "embedding_model", None)
+    if backend == "fake":
+        from .fakes.embedding import FakeEmbeddingAdapter
+
+        return FakeEmbeddingAdapter(model=model or "fake-embed")
+    if backend == "ollama":
+        if not model:
+            raise ValueError(
+                "--embedding-backend ollama requires --embedding-model "
+                "(e.g. --embedding-model nomic-embed-text)"
+            )
+        from .adapters.ollama import DEFAULT_BASE_URL as OLLAMA_DEFAULT_URL
+        from .adapters.ollama_embeddings import OllamaEmbeddingAdapter
+
+        base_url = (
+            getattr(args, "embedding_ollama_url", None)
+            or getattr(args, "ollama_url", None)
+            or OLLAMA_DEFAULT_URL
+        )
+        allow_non_localhost = bool(
+            getattr(args, "allow_non_localhost_ollama", False)
+        )
+        return OllamaEmbeddingAdapter(
+            model=model,
+            base_url=base_url,
+            allow_non_localhost=allow_non_localhost,
+        )
+    raise ValueError(f"unsupported embedding backend: {backend!r}")
 
 
 def _decision_to_safe_dict(
@@ -731,14 +781,113 @@ def cmd_index_files(args: argparse.Namespace) -> int:
         return EXIT_DENIED
     save_index_json(result.index, out_path)
 
+    # Optional embedding index built alongside the metadata index.
+    embed_result_summary = None
+    embed_warnings: List[str] = []
+    if bool(getattr(args, "embed", False)):
+        embed_out_arg = getattr(args, "embedding_index_path", None)
+        embed_out_path = (
+            Path(embed_out_arg).resolve()
+            if embed_out_arg
+            else default_vector_index_path(project_root)
+        )
+        if not str(embed_out_path).startswith(str(project_root)):
+            sys.stderr.write(
+                "wolf cli: --embedding-index-path must be inside --project-root\n"
+            )
+            return EXIT_DENIED
+        try:
+            embedder = _build_embedder_from_args(args)
+        except ValueError as exc:
+            sys.stderr.write(f"wolf cli: {exc}\n")
+            return EXIT_DENIED
+
+        max_embed_bytes = int(
+            getattr(args, "embedding_input_bytes", 4096)
+        )
+        vec_entries: List[VectorEntry] = []
+        for entry in result.index.entries:
+            full = (project_root / entry.path).resolve()
+            try:
+                blob = full.read_bytes()[:max_embed_bytes]
+                text_for_embedding = blob.decode(entry.encoding, errors="ignore")
+            except OSError as exc:
+                embed_warnings.append(
+                    f"embed: skipped {entry.path} (read: {type(exc).__name__})"
+                )
+                continue
+            try:
+                vec = embedder.embed(text_for_embedding)
+            except AdapterError as exc:
+                embed_warnings.append(
+                    f"embed: skipped {entry.path} (embedder: {exc.label})"
+                )
+                continue
+            vec_entries.append(
+                VectorEntry(
+                    path=entry.path,
+                    size=entry.size,
+                    mtime=entry.mtime,
+                    extension=entry.extension,
+                    snippet=entry.snippet,
+                    encoding=entry.encoding,
+                    embedding=tuple(vec),
+                )
+            )
+
+        if not vec_entries:
+            sys.stderr.write(
+                "wolf cli: embedding index would be empty; skipping save\n"
+            )
+            embed_result_summary = {
+                "indexed_embeddings": 0,
+                "embedding_index_path": None,
+                "embedding_warnings": embed_warnings,
+            }
+        else:
+            model_name = getattr(args, "embedding_model", None) or "fake-embed"
+            vector_index = VectorIndex(
+                project_root=str(project_root),
+                created_at=result.index.created_at,
+                embedding_model=model_name,
+                dim=len(vec_entries[0].embedding),
+                entries=tuple(vec_entries),
+                skipped=tuple(embed_warnings),
+            )
+            save_vector_index_json(vector_index, embed_out_path)
+            embed_result_summary = {
+                "indexed_embeddings": len(vec_entries),
+                "embedding_index_path": str(
+                    embed_out_path.relative_to(project_root)
+                ),
+                "embedding_model": model_name,
+                "embedding_dim": vector_index.dim,
+            }
+
     if output_mode == "text":
         sys.stdout.write(
             f"indexed {result.accepted_count} files "
             f"(skipped {result.skipped_count}) -> "
             f"{out_path.relative_to(project_root)}\n"
         )
+        if embed_result_summary:
+            ep = embed_result_summary.get("embedding_index_path")
+            n = embed_result_summary.get("indexed_embeddings", 0)
+            if ep:
+                sys.stdout.write(
+                    f"embedded {n} files -> {ep}\n"
+                )
+            else:
+                sys.stdout.write("embedding index was empty (no files saved)\n")
         return EXIT_SUCCESS
 
+    payload_result = {
+        "indexed": result.accepted_count,
+        "skipped": result.skipped_count,
+        "index_path": str(out_path.relative_to(project_root)),
+    }
+    if embed_result_summary:
+        payload_result.update(embed_result_summary)
     _print_json(
         {
             "allowed": True,
@@ -749,12 +898,8 @@ def cmd_index_files(args: argparse.Namespace) -> int:
             "provider_called": False,
             "audit_event_id": gate.audit_event_id,
             "failed_checks": [],
-            "warnings": list(result.index.skipped),
-            "result": {
-                "indexed": result.accepted_count,
-                "skipped": result.skipped_count,
-                "index_path": str(out_path.relative_to(project_root)),
-            },
+            "warnings": list(result.index.skipped) + embed_warnings,
+            "result": payload_result,
         }
     )
     return EXIT_SUCCESS
@@ -771,6 +916,143 @@ def cmd_search_files(args: argparse.Namespace) -> int:
         sys.stderr.write("wolf cli: --query is required\n")
         return EXIT_DENIED
 
+    boundary = ProjectBoundaryGuard(project_root)
+    sensitive = SensitivePathGuard(project_root=project_root)
+    max_hits = int(getattr(args, "max_hits", SEARCH_DEFAULT_MAX_HITS))
+    use_semantic = bool(getattr(args, "semantic", False))
+
+    if use_semantic:
+        # Semantic mode: load vector index and embed the query.
+        vec_path_arg = getattr(args, "embedding_index_path", None)
+        vec_path = (
+            Path(vec_path_arg).resolve()
+            if vec_path_arg
+            else default_vector_index_path(project_root)
+        )
+        if not str(vec_path).startswith(str(project_root)):
+            sys.stderr.write(
+                "wolf cli: --embedding-index-path must be inside --project-root\n"
+            )
+            return EXIT_DENIED
+        try:
+            vec_index = load_vector_index_json(vec_path)
+        except (FileNotFoundError, ValueError) as exc:
+            if output_mode == "text":
+                sys.stderr.write(f"wolf cli: semantic index load failed: {exc}\n")
+            else:
+                _print_json(
+                    {
+                        "allowed": False,
+                        "executed": False,
+                        "requires_confirmation": False,
+                        "stage": "file_read",
+                        "reason": f"semantic index load failed: {exc}",
+                        "provider_called": False,
+                        "audit_event_id": None,
+                        "failed_checks": ["semantic_index: load_failed"],
+                        "warnings": [],
+                    }
+                )
+            return EXIT_DENIED
+        try:
+            embedder = _build_embedder_from_args(args)
+        except ValueError as exc:
+            sys.stderr.write(f"wolf cli: {exc}\n")
+            return EXIT_DENIED
+        try:
+            sem_hits = search_semantic(
+                vec_index,
+                query,
+                embedder=embedder,
+                project_root=project_root,
+                boundary=boundary,
+                sensitive=sensitive,
+                max_hits=max_hits,
+            )
+        except AdapterError as exc:
+            if output_mode == "text":
+                sys.stderr.write(
+                    f"wolf cli: embedder failed: {exc.label}\n"
+                )
+            else:
+                _print_json(
+                    {
+                        "allowed": False,
+                        "executed": False,
+                        "requires_confirmation": False,
+                        "stage": "provider",
+                        "reason": f"embedder failed: {exc.label}",
+                        "provider_called": True,
+                        "audit_event_id": None,
+                        "failed_checks": [f"embedder: {exc.label}"],
+                        "warnings": [],
+                    }
+                )
+            return EXIT_DENIED
+
+        if not sem_hits:
+            if output_mode == "text":
+                sys.stderr.write(
+                    f"wolf cli: no semantic hits for {query!r}\n"
+                )
+            else:
+                _print_json(
+                    {
+                        "allowed": False,
+                        "executed": False,
+                        "requires_confirmation": False,
+                        "stage": "search",
+                        "reason": "no hits",
+                        "provider_called": False,
+                        "audit_event_id": None,
+                        "failed_checks": [],
+                        "warnings": [],
+                        "result": {
+                            "hits": [],
+                            "query": query,
+                            "mode": "semantic",
+                        },
+                    }
+                )
+            return EXIT_DENIED
+
+        if output_mode == "text":
+            for h in sem_hits:
+                snippet_one_line = h.snippet.replace("\n", " ")
+                sys.stdout.write(
+                    f"{h.path} (score={h.score:.4f}): "
+                    f"{snippet_one_line}\n"
+                )
+            return EXIT_SUCCESS
+
+        _print_json(
+            {
+                "allowed": True,
+                "executed": True,
+                "requires_confirmation": False,
+                "stage": "complete",
+                "reason": f"{len(sem_hits)} semantic hit(s)",
+                "provider_called": True,
+                "audit_event_id": None,
+                "failed_checks": [],
+                "warnings": [],
+                "result": {
+                    "query": query,
+                    "mode": "semantic",
+                    "hits": [
+                        {
+                            "path": h.path,
+                            "score": h.score,
+                            "snippet": h.snippet,
+                        }
+                        for h in sem_hits
+                    ],
+                },
+            }
+        )
+        return EXIT_SUCCESS
+
+    # Substring (default) path.
     index_path_arg = getattr(args, "index_path", None)
     index_path = (
         Path(index_path_arg).resolve()
@@ -802,10 +1084,6 @@ def cmd_search_files(args: argparse.Namespace) -> int:
                 }
             )
         return EXIT_DENIED
-
-    boundary = ProjectBoundaryGuard(project_root)
-    sensitive = SensitivePathGuard(project_root=project_root)
-    max_hits = int(getattr(args, "max_hits", SEARCH_DEFAULT_MAX_HITS))
 
     hits = search_index(
         index,
@@ -875,6 +1153,251 @@ def cmd_search_files(args: argparse.Namespace) -> int:
     return EXIT_SUCCESS
 
 
+def _cmd_search_summarize_semantic(
+    *,
+    args: argparse.Namespace,
+    project_root: Path,
+    output_mode: str,
+    query: str,
+    router: Router,
+    boundary,
+    sensitive,
+    build_warnings: List[str],
+) -> int:
+    vec_path_arg = getattr(args, "embedding_index_path", None)
+    vec_path = (
+        Path(vec_path_arg).resolve()
+        if vec_path_arg
+        else default_vector_index_path(project_root)
+    )
+    if not str(vec_path).startswith(str(project_root)):
+        sys.stderr.write(
+            "wolf cli: --embedding-index-path must be inside --project-root\n"
+        )
+        return EXIT_DENIED
+    try:
+        vec_index = load_vector_index_json(vec_path)
+    except (FileNotFoundError, ValueError) as exc:
+        if output_mode == "text":
+            sys.stderr.write(
+                f"wolf cli: semantic index load failed: {exc}\n"
+            )
+        else:
+            _print_json(
+                {
+                    "allowed": False,
+                    "executed": False,
+                    "requires_confirmation": False,
+                    "stage": "file_read",
+                    "reason": f"semantic index load failed: {exc}",
+                    "provider_called": False,
+                    "audit_event_id": None,
+                    "failed_checks": ["semantic_index: load_failed"],
+                    "warnings": build_warnings,
+                }
+            )
+        return EXIT_DENIED
+
+    try:
+        embedder = _build_embedder_from_args(args)
+    except ValueError as exc:
+        sys.stderr.write(f"wolf cli: {exc}\n")
+        return EXIT_DENIED
+
+    limit = int(getattr(args, "limit", 5))
+    max_files = int(getattr(args, "max_files", 5))
+    include_per_file_summary = bool(
+        getattr(args, "include_per_file_summary", False)
+    )
+    try:
+        sem_hits = search_semantic(
+            vec_index,
+            query,
+            embedder=embedder,
+            project_root=project_root,
+            boundary=boundary,
+            sensitive=sensitive,
+            max_hits=limit,
+        )
+    except AdapterError as exc:
+        if output_mode == "text":
+            sys.stderr.write(f"wolf cli: embedder failed: {exc.label}\n")
+        else:
+            _print_json(
+                {
+                    "allowed": False,
+                    "executed": False,
+                    "requires_confirmation": False,
+                    "stage": "provider",
+                    "reason": f"embedder failed: {exc.label}",
+                    "provider_called": True,
+                    "audit_event_id": None,
+                    "failed_checks": [f"embedder: {exc.label}"],
+                    "warnings": build_warnings,
+                }
+            )
+        return EXIT_DENIED
+
+    if not sem_hits:
+        payload = {
+            "allowed": False,
+            "executed": False,
+            "requires_confirmation": False,
+            "stage": "search",
+            "reason": "no hits",
+            "provider_called": True,
+            "audit_event_id": None,
+            "failed_checks": [],
+            "warnings": build_warnings,
+            "result": {"query": query, "hit_count": 0, "mode": "semantic"},
+        }
+        if output_mode == "text":
+            sys.stderr.write(
+                f"wolf cli: no semantic hits for {query!r}\n"
+            )
+        else:
+            _print_json(payload)
+        return EXIT_DENIED
+
+    chunk_size = int(getattr(args, "chunk_size", DEFAULT_CHUNK_SIZE))
+    max_chunks = int(getattr(args, "max_chunks", DEFAULT_MAX_CHUNKS))
+    no_chunk = bool(getattr(args, "no_chunk", False))
+    per_file_summaries: List[str] = []
+    file_records: List[dict] = []
+    warnings: List[str] = list(build_warnings)
+    accepted = 0
+    for hit in sem_hits[:max_files]:
+        full_path = (project_root / hit.path).resolve()
+        bd = boundary.check(full_path)
+        sd = sensitive.check(full_path)
+        if not bd.allowed or not sd.allowed:
+            warnings.append(
+                f"search-summarize: skipped {hit.path} (gate denied)"
+            )
+            continue
+        try:
+            read_result = read_text_file(
+                full_path,
+                max_bytes=int(
+                    getattr(
+                        args, "max_bytes_per_file", FILE_DEFAULT_MAX_BYTES
+                    )
+                ),
+            )
+        except FileReadError as exc:
+            warnings.append(
+                f"search-summarize: skipped {hit.path} "
+                f"(file_read: {exc.label})"
+            )
+            continue
+        decision = _summarize_text_via_router(
+            router=router,
+            text=read_result.text,
+            source_path=full_path,
+            encoding=read_result.encoding,
+            byte_size=read_result.byte_size,
+            chunk_size=chunk_size,
+            max_chunks=max_chunks,
+            no_chunk=no_chunk,
+        )
+        if not decision.allowed or not isinstance(decision.result, str):
+            warnings.append(
+                f"search-summarize: skipped {hit.path} "
+                f"(stage={decision.stage})"
+            )
+            continue
+        per_file_summaries.append(f"[{hit.path}]\n{decision.result}")
+        warnings.extend(decision.warnings)
+        record = {
+            "path": hit.path,
+            "score": hit.score,
+            "summary_length": len(decision.result),
+        }
+        if include_per_file_summary:
+            record["summary"] = decision.result
+        file_records.append(record)
+        accepted += 1
+
+    if accepted == 0:
+        payload = {
+            "allowed": False,
+            "executed": False,
+            "requires_confirmation": False,
+            "stage": "search",
+            "reason": "no files could be summarized",
+            "provider_called": True,
+            "audit_event_id": None,
+            "failed_checks": ["search-summarize: no eligible hits"],
+            "warnings": warnings,
+            "result": {
+                "query": query,
+                "mode": "semantic",
+                "hit_count": len(sem_hits),
+                "summarized_count": 0,
+                "skipped_count": len(sem_hits),
+                "files": [],
+            },
+        }
+        if output_mode == "text":
+            sys.stderr.write(
+                f"wolf cli: {len(sem_hits)} semantic hit(s) but none "
+                "could be summarized\n"
+            )
+        else:
+            _print_json(payload)
+        return EXIT_DENIED
+
+    aggregated_text = "\n\n".join(per_file_summaries)
+    final_body = wrap_untrusted(
+        aggregated_text,
+        SourceKind.LOCAL_DOCUMENT,
+        source_ref=f"search:semantic:{query}",
+        metadata={
+            "hit_count": str(len(sem_hits)),
+            "summarized_count": str(accepted),
+        },
+    )
+    final = router.route(
+        RouterAction(
+            kind=ActionKind.LLM_SUMMARIZE,
+            risk_level=RiskLevel.LOW,
+            body=final_body,
+        )
+    )
+    if warnings:
+        final = _decision_with_extra_warnings(final, warnings)
+
+    if output_mode == "text":
+        if final.allowed and isinstance(final.result, str):
+            sys.stdout.write(final.result)
+            if not final.result.endswith("\n"):
+                sys.stdout.write("\n")
+            if final.warnings:
+                sys.stderr.write(
+                    f"wolf cli: {len(final.warnings)} warning(s) during "
+                    f"search-summarize\n"
+                )
+            return EXIT_SUCCESS
+        sys.stderr.write(
+            f"wolf cli: stage={final.stage} reason={final.reason}\n"
+        )
+        return _exit_code_for(final)
+
+    payload = _decision_to_safe_dict(final, include_result=False)
+    payload["result"] = {
+        "query": query,
+        "mode": "semantic",
+        "hit_count": len(sem_hits),
+        "summarized_count": accepted,
+        "skipped_count": len(sem_hits) - accepted,
+        "files": file_records,
+    }
+    if final.allowed and isinstance(final.result, str):
+        payload["result"]["summary"] = final.result
+    _print_json(payload)
+    return _exit_code_for(final)
+
+
 def cmd_search_summarize(args: argparse.Namespace) -> int:
     """Search the index and summarize matching files.
 
@@ -930,6 +1453,21 @@ def cmd_search_summarize(args: argparse.Namespace) -> int:
     sensitive = SensitivePathGuard(project_root=project_root)
     build_index_first = bool(getattr(args, "build_index", False))
     build_warnings: List[str] = []
+    use_semantic = bool(getattr(args, "semantic", False))
+
+    # Semantic path: load vector index, embed query, get hits, then jump
+    # straight to the per-hit summarize loop using a normalized hit list.
+    if use_semantic:
+        return _cmd_search_summarize_semantic(
+            args=args,
+            project_root=project_root,
+            output_mode=output_mode,
+            query=query,
+            router=router,
+            boundary=boundary,
+            sensitive=sensitive,
+            build_warnings=build_warnings,
+        )
 
     if build_index_first or not index_path.exists():
         if not build_index_first and not index_path.exists():
@@ -1504,6 +2042,46 @@ def build_parser() -> argparse.ArgumentParser:
     ifp.add_argument("--ollama-url", default=None)
     ifp.add_argument("--allow-non-localhost-ollama", action="store_true")
     ifp.add_argument(
+        "--embed",
+        action="store_true",
+        help="Also build the embedding index (requires --embedding-model)",
+    )
+    ifp.add_argument(
+        "--embedding-backend",
+        choices=("fake", "ollama"),
+        default="ollama",
+        help="Embedding backend (default: ollama)",
+    )
+    ifp.add_argument(
+        "--embedding-model",
+        default=None,
+        help=(
+            "Embedding model name (required when --embedding-backend ollama)"
+        ),
+    )
+    ifp.add_argument(
+        "--embedding-ollama-url",
+        default=None,
+        help="Ollama server URL for embeddings (default: --ollama-url or localhost)",
+    )
+    ifp.add_argument(
+        "--embedding-index-path",
+        default=None,
+        help=(
+            "Where to write the embedding JSON index "
+            "(default: <project_root>/.wolf/index/embeddings.json)"
+        ),
+    )
+    ifp.add_argument(
+        "--embedding-input-bytes",
+        type=int,
+        default=4096,
+        help=(
+            "Bytes per file to send to the embedder (default: 4096). "
+            "Larger values may exceed the model's context."
+        ),
+    )
+    ifp.add_argument(
         "--output",
         choices=("json", "text"),
         default="json",
@@ -1532,6 +2110,44 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=SEARCH_DEFAULT_MAX_HITS,
         help=f"Maximum hits to return (default: {SEARCH_DEFAULT_MAX_HITS})",
+    )
+    sr.add_argument(
+        "--semantic",
+        action="store_true",
+        help=(
+            "Use the embedding index instead of substring match. "
+            "Requires that index-files was run with --embed and that "
+            "--embedding-model matches the index's embedding model."
+        ),
+    )
+    sr.add_argument(
+        "--embedding-index-path",
+        default=None,
+        help=(
+            "Path to the embedding JSON index "
+            "(default: <project_root>/.wolf/index/embeddings.json)"
+        ),
+    )
+    sr.add_argument(
+        "--embedding-backend",
+        choices=("fake", "ollama"),
+        default="ollama",
+        help="Embedding backend (default: ollama)",
+    )
+    sr.add_argument(
+        "--embedding-model",
+        default=None,
+        help="Embedding model name (required for ollama backend)",
+    )
+    sr.add_argument(
+        "--embedding-ollama-url",
+        default=None,
+        help="Ollama server URL for embeddings",
+    )
+    sr.add_argument(
+        "--allow-non-localhost-ollama",
+        action="store_true",
+        help="Permit a non-localhost embedding URL",
     )
     sr.add_argument(
         "--output",
@@ -1663,6 +2279,36 @@ def build_parser() -> argparse.ArgumentParser:
             "result.files[].summary. Default omits per-file summaries "
             "to keep the payload small. Text output ignores this flag."
         ),
+    )
+    ss.add_argument(
+        "--semantic",
+        action="store_true",
+        help=(
+            "Use the embedding vector index for retrieval. Requires that "
+            "index-files was run with --embed and that --embedding-model "
+            "matches the index's model."
+        ),
+    )
+    ss.add_argument(
+        "--embedding-index-path",
+        default=None,
+        help="Path to the embedding JSON index",
+    )
+    ss.add_argument(
+        "--embedding-backend",
+        choices=("fake", "ollama"),
+        default="ollama",
+        help="Embedding backend (default: ollama)",
+    )
+    ss.add_argument(
+        "--embedding-model",
+        default=None,
+        help="Embedding model name (required for ollama embedding backend)",
+    )
+    ss.add_argument(
+        "--embedding-ollama-url",
+        default=None,
+        help="Ollama server URL for embeddings",
     )
     ss.set_defaults(func=cmd_search_summarize)
 
