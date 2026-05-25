@@ -16,6 +16,7 @@ services:
       - ./.github:/app/.github:ro
       - ./pyproject.toml:/app/pyproject.toml:ro
       - ./CLAUDE.md:/app/CLAUDE.md:ro
+      - ./README.md:/app/README.md:ro
       - ./Dockerfile:/app/Dockerfile:ro
       - ./docker-compose.yml:/app/docker-compose.yml:ro
       - ./docker-compose.gpu.yml:/app/docker-compose.gpu.yml:ro

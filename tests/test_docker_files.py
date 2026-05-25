@@ -117,6 +117,7 @@ class DefaultComposeTest(unittest.TestCase):
             r"\./scripts:/app/scripts:ro",
             r"\./docs:/app/docs:ro",
             r"\./CLAUDE\.md:/app/CLAUDE\.md:ro",
+            r"\./README\.md:/app/README\.md:ro",
             r"\./\.github:/app/\.github:ro",
         )
         for pattern in required:
