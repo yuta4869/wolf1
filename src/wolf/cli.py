@@ -16,10 +16,24 @@ from .files.chunking import (
     DEFAULT_MAX_CHUNKS,
     split_text,
 )
+from .files.index import (
+    DEFAULT_INCLUDE_EXTS as INDEX_DEFAULT_EXTS,
+    DEFAULT_MAX_BYTES_PER_FILE as INDEX_DEFAULT_MAX_BYTES,
+    DEFAULT_MAX_FILES as INDEX_DEFAULT_MAX_FILES,
+    build_index,
+    default_index_path,
+    load_index_json,
+    save_index_json,
+)
 from .files.read_text import (
     DEFAULT_MAX_BYTES as FILE_DEFAULT_MAX_BYTES,
     FileReadError,
     read_text_file,
+)
+from .files.search import (
+    DEFAULT_MAX_HITS as SEARCH_DEFAULT_MAX_HITS,
+    SearchHit,
+    search as search_index,
 )
 from .orchestrator.router import (
     ActionKind,
@@ -613,6 +627,233 @@ def cmd_summarize_dir(args: argparse.Namespace) -> int:
     return _emit_decision(final, output_mode=output_mode, include_result=True)
 
 
+def cmd_index_files(args: argparse.Namespace) -> int:
+    from .safety.project_boundary import ProjectBoundaryGuard
+    from .safety.sensitive_paths import SensitivePathGuard
+
+    project_root = Path(args.project_root).resolve()
+    output_mode = getattr(args, "output", "json")
+
+    # Build the Router only to run the directory's path through
+    # boundary + sensitive gates and to write an audit event for the
+    # index build. We do not use the LLM at all here.
+    try:
+        llm = _build_llm_from_args(args)
+    except ValueError as exc:
+        sys.stderr.write(f"wolf cli: {exc}\n")
+        return EXIT_DENIED
+    router = _build_router(project_root, llm=llm)
+
+    gate = router.route(
+        RouterAction(
+            kind=ActionKind.FILE_READ,
+            risk_level=RiskLevel.LOW,
+            target_path=args.path,
+        )
+    )
+    if not gate.allowed:
+        return _emit_decision(gate, output_mode=output_mode, include_result=False)
+
+    target_dir = Path(args.path)
+    if not target_dir.is_absolute():
+        target_dir = (project_root / target_dir).resolve()
+    if not target_dir.is_dir():
+        if output_mode == "text":
+            sys.stderr.write("wolf cli: index target is not a directory\n")
+        else:
+            _print_json(
+                {
+                    "allowed": False,
+                    "executed": False,
+                    "requires_confirmation": False,
+                    "stage": "file_read",
+                    "reason": "index target is not a directory",
+                    "provider_called": False,
+                    "audit_event_id": gate.audit_event_id,
+                    "failed_checks": ["index: not a directory"],
+                    "warnings": [],
+                }
+            )
+        return EXIT_DENIED
+
+    boundary = ProjectBoundaryGuard(project_root)
+    sensitive = SensitivePathGuard(project_root=project_root)
+    include = tuple(getattr(args, "include", None) or [])
+    exclude = tuple(getattr(args, "exclude", None) or [])
+    recursive = not bool(getattr(args, "no_recursive", False))
+
+    result = build_index(
+        project_root=project_root,
+        target_dir=target_dir,
+        boundary=boundary,
+        sensitive=sensitive,
+        recursive=recursive,
+        include=include or None,
+        exclude=exclude or None,
+        max_files=int(getattr(args, "max_files", INDEX_DEFAULT_MAX_FILES)),
+        max_bytes_per_file=int(
+            getattr(args, "max_bytes", INDEX_DEFAULT_MAX_BYTES)
+        ),
+    )
+
+    output_arg = getattr(args, "index_output", None)
+    out_path = (
+        Path(output_arg).resolve()
+        if output_arg
+        else default_index_path(project_root)
+    )
+    # Confine the index output to project_root.
+    if not str(out_path).startswith(str(project_root)):
+        sys.stderr.write(
+            "wolf cli: --index-output must be inside --project-root\n"
+        )
+        return EXIT_DENIED
+    save_index_json(result.index, out_path)
+
+    if output_mode == "text":
+        sys.stdout.write(
+            f"indexed {result.accepted_count} files "
+            f"(skipped {result.skipped_count}) -> "
+            f"{out_path.relative_to(project_root)}\n"
+        )
+        return EXIT_SUCCESS
+
+    _print_json(
+        {
+            "allowed": True,
+            "executed": True,
+            "requires_confirmation": False,
+            "stage": "complete",
+            "reason": "index built",
+            "provider_called": False,
+            "audit_event_id": gate.audit_event_id,
+            "failed_checks": [],
+            "warnings": list(result.index.skipped),
+            "result": {
+                "indexed": result.accepted_count,
+                "skipped": result.skipped_count,
+                "index_path": str(out_path.relative_to(project_root)),
+            },
+        }
+    )
+    return EXIT_SUCCESS
+
+
+def cmd_search_files(args: argparse.Namespace) -> int:
+    from .safety.project_boundary import ProjectBoundaryGuard
+    from .safety.sensitive_paths import SensitivePathGuard
+
+    project_root = Path(args.project_root).resolve()
+    output_mode = getattr(args, "output", "json")
+    query = getattr(args, "query", None)
+    if not query:
+        sys.stderr.write("wolf cli: --query is required\n")
+        return EXIT_DENIED
+
+    index_path_arg = getattr(args, "index_path", None)
+    index_path = (
+        Path(index_path_arg).resolve()
+        if index_path_arg
+        else default_index_path(project_root)
+    )
+    if not str(index_path).startswith(str(project_root)):
+        sys.stderr.write(
+            "wolf cli: --index-path must be inside --project-root\n"
+        )
+        return EXIT_DENIED
+    try:
+        index = load_index_json(index_path)
+    except (FileNotFoundError, ValueError) as exc:
+        if output_mode == "text":
+            sys.stderr.write(f"wolf cli: index load failed: {exc}\n")
+        else:
+            _print_json(
+                {
+                    "allowed": False,
+                    "executed": False,
+                    "requires_confirmation": False,
+                    "stage": "file_read",
+                    "reason": f"index load failed: {exc}",
+                    "provider_called": False,
+                    "audit_event_id": None,
+                    "failed_checks": [f"index: load_failed"],
+                    "warnings": [],
+                }
+            )
+        return EXIT_DENIED
+
+    boundary = ProjectBoundaryGuard(project_root)
+    sensitive = SensitivePathGuard(project_root=project_root)
+    max_hits = int(getattr(args, "max_hits", SEARCH_DEFAULT_MAX_HITS))
+
+    hits = search_index(
+        index,
+        query,
+        project_root=project_root,
+        boundary=boundary,
+        sensitive=sensitive,
+        max_hits=max_hits,
+    )
+
+    if not hits:
+        if output_mode == "text":
+            sys.stderr.write(f"wolf cli: no hits for {query!r}\n")
+        else:
+            _print_json(
+                {
+                    "allowed": False,
+                    "executed": False,
+                    "requires_confirmation": False,
+                    "stage": "search",
+                    "reason": "no hits",
+                    "provider_called": False,
+                    "audit_event_id": None,
+                    "failed_checks": [],
+                    "warnings": [],
+                    "result": {"hits": [], "query": query},
+                }
+            )
+        return EXIT_DENIED
+
+    if output_mode == "text":
+        for h in hits:
+            line_label = f":{h.line_number}" if h.line_number else ""
+            snippet_one_line = h.snippet.replace("\n", " ")
+            sys.stdout.write(
+                f"{h.path}{line_label} ({h.match_count} match"
+                f"{'es' if h.match_count != 1 else ''}): "
+                f"{snippet_one_line}\n"
+            )
+        return EXIT_SUCCESS
+
+    _print_json(
+        {
+            "allowed": True,
+            "executed": True,
+            "requires_confirmation": False,
+            "stage": "complete",
+            "reason": f"{len(hits)} hit(s)",
+            "provider_called": False,
+            "audit_event_id": None,
+            "failed_checks": [],
+            "warnings": [],
+            "result": {
+                "query": query,
+                "hits": [
+                    {
+                        "path": h.path,
+                        "line_number": h.line_number,
+                        "snippet": h.snippet,
+                        "match_count": h.match_count,
+                    }
+                    for h in hits
+                ],
+            },
+        }
+    )
+    return EXIT_SUCCESS
+
+
 def cmd_check_path(args: argparse.Namespace) -> int:
     project_root = Path(args.project_root).resolve()
     router = _build_router(project_root)
@@ -869,6 +1110,105 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output format (default: json)",
     )
     sd.set_defaults(func=cmd_summarize_dir)
+
+    ifp = sub.add_parser(
+        "index-files",
+        help=(
+            "Walk a project-local directory and write a JSON file index "
+            "(metadata + short snippet per file; no full bodies stored)"
+        ),
+    )
+    ifp.add_argument(
+        "--path",
+        required=True,
+        help="Directory to index (relative paths resolve against --project-root)",
+    )
+    ifp.add_argument(
+        "--no-recursive",
+        action="store_true",
+        help="Index only files directly under --path",
+    )
+    ifp.add_argument(
+        "--include",
+        action="append",
+        default=None,
+        help=(
+            "fnmatch pattern to include; may be repeated. Default: "
+            "*.txt, *.md, *.rst, *.py"
+        ),
+    )
+    ifp.add_argument(
+        "--exclude",
+        action="append",
+        default=None,
+        help="fnmatch pattern to exclude; may be repeated",
+    )
+    ifp.add_argument(
+        "--max-files",
+        type=int,
+        default=INDEX_DEFAULT_MAX_FILES,
+        help=f"Maximum files to index (default: {INDEX_DEFAULT_MAX_FILES})",
+    )
+    ifp.add_argument(
+        "--max-bytes",
+        type=int,
+        default=INDEX_DEFAULT_MAX_BYTES,
+        help="Per-file size limit (default: 1 MiB)",
+    )
+    ifp.add_argument(
+        "--index-output",
+        default=None,
+        help=(
+            "Where to write the JSON index "
+            "(default: <project_root>/.wolf/index/files.json)"
+        ),
+    )
+    ifp.add_argument(
+        "--backend",
+        choices=("fake", "ollama"),
+        default="fake",
+        help="LLM backend for audit / pipeline coherence (default: fake)",
+    )
+    ifp.add_argument("--model", default=None)
+    ifp.add_argument("--ollama-url", default=None)
+    ifp.add_argument("--allow-non-localhost-ollama", action="store_true")
+    ifp.add_argument(
+        "--output",
+        choices=("json", "text"),
+        default="json",
+        help="Output format (default: json)",
+    )
+    ifp.set_defaults(func=cmd_index_files)
+
+    sr = sub.add_parser(
+        "search-files",
+        help=(
+            "Keyword search over a previously built JSON file index "
+            "(case-insensitive substring; snippet around match)"
+        ),
+    )
+    sr.add_argument("--query", required=True, help="Substring to search for")
+    sr.add_argument(
+        "--index-path",
+        default=None,
+        help=(
+            "Path to the JSON index file "
+            "(default: <project_root>/.wolf/index/files.json)"
+        ),
+    )
+    sr.add_argument(
+        "--max-hits",
+        type=int,
+        default=SEARCH_DEFAULT_MAX_HITS,
+        help=f"Maximum hits to return (default: {SEARCH_DEFAULT_MAX_HITS})",
+    )
+    sr.add_argument(
+        "--output",
+        choices=("json", "text"),
+        default="json",
+        help="Output format (default: json)",
+    )
+    sr.set_defaults(func=cmd_search_files)
 
     cp = sub.add_parser(
         "check-path",

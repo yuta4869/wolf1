@@ -1314,5 +1314,202 @@ class SummarizeDirTest(unittest.TestCase):
         self.assertEqual(payload["result"], "dir-summary")
 
 
+class IndexAndSearchCliTest(unittest.TestCase):
+    """index-files / search-files subcommand tests (PR #17)."""
+
+    def setUp(self) -> None:
+        self.fixture = _ProjectFixture()
+        docs = self.fixture.root / "docs"
+        docs.mkdir()
+        (docs / "alpha.md").write_text(
+            "Alpha document. We will summarize the meeting.\n",
+            encoding="utf-8",
+        )
+        (docs / "beta.md").write_text(
+            "Beta is unrelated.\n", encoding="utf-8"
+        )
+        (docs / "gamma.py").write_text(
+            "def summarize(): pass\n", encoding="utf-8"
+        )
+        (docs / "binary.png").write_bytes(
+            b"\x89PNG\r\n\x1a\n" + b"\x00" * 30
+        )
+        # .env at root must be skipped.
+        (self.fixture.root / ".env").write_text(
+            "API_KEY=x\n", encoding="utf-8"
+        )
+
+    def tearDown(self) -> None:
+        self.fixture.cleanup()
+
+    def _run(self, *extra_args: str):
+        return _run_inproc(
+            [
+                "--project-root",
+                str(self.fixture.root),
+                *extra_args,
+            ]
+        )
+
+    def _index_path(self) -> Path:
+        return self.fixture.root / ".wolf" / "index" / "files.json"
+
+    # ---- index-files ----
+
+    def test_index_files_default_extensions(self) -> None:
+        code, out, _ = self._run(
+            "index-files", "--path", "docs"
+        )
+        self.assertEqual(code, EXIT_SUCCESS, msg=out)
+        payload = json.loads(out)
+        self.assertEqual(payload["stage"], "complete")
+        self.assertGreaterEqual(payload["result"]["indexed"], 3)
+        self.assertTrue(self._index_path().exists())
+
+    def test_index_files_skips_binary_when_included(self) -> None:
+        code, out, _ = self._run(
+            "index-files",
+            "--path",
+            "docs",
+            "--include",
+            "*.md",
+            "--include",
+            "*.png",
+        )
+        self.assertEqual(code, EXIT_SUCCESS, msg=out)
+        payload = json.loads(out)
+        # PNG must show up in skipped warnings, not in the indexed count.
+        joined = " | ".join(payload["warnings"])
+        self.assertIn("binary.png", joined)
+
+    def test_index_files_secrets_dir_denied(self) -> None:
+        (self.fixture.root / "secrets" / "extra.txt").write_text(
+            "secret\n", encoding="utf-8"
+        )
+        code, out, _ = self._run(
+            "index-files", "--path", "secrets"
+        )
+        self.assertEqual(code, EXIT_DENIED)
+        payload = json.loads(out)
+        self.assertEqual(payload["stage"], "sensitive_path")
+
+    def test_index_files_env_skipped_when_explicitly_included(self) -> None:
+        code, out, _ = self._run(
+            "index-files",
+            "--path",
+            ".",
+            "--include",
+            ".env",
+            "--include",
+            "*.md",
+        )
+        self.assertEqual(code, EXIT_SUCCESS)
+        payload = json.loads(out)
+        joined = " | ".join(payload["warnings"])
+        self.assertIn(".env", joined)
+        self.assertIn("sensitive_path", joined)
+
+    def test_index_files_max_files(self) -> None:
+        code, out, _ = self._run(
+            "index-files",
+            "--path",
+            "docs",
+            "--max-files",
+            "1",
+        )
+        self.assertEqual(code, EXIT_SUCCESS)
+        payload = json.loads(out)
+        self.assertEqual(payload["result"]["indexed"], 1)
+
+    def test_index_snippet_is_bounded(self) -> None:
+        # The index stores a bounded preview per file, not the full body.
+        sentinel = "FULL_BODY_LEAK_SENTINEL_INDEX_99"
+        # Body is much larger than the default snippet budget (160 B).
+        long_body = sentinel + "\n" + ("filler " * 500)  # ~3500 bytes
+        (self.fixture.root / "docs" / "long.md").write_text(
+            long_body, encoding="utf-8"
+        )
+        code, _, _ = self._run("index-files", "--path", "docs")
+        self.assertEqual(code, EXIT_SUCCESS)
+        # Locate the long.md entry in the saved JSON index.
+        index_obj = json.loads(self._index_path().read_text(encoding="utf-8"))
+        long_entry = next(
+            e for e in index_obj["entries"] if e["path"] == "docs/long.md"
+        )
+        # Snippet is bounded by the default snippet_bytes (160) — well
+        # below the full body length.
+        self.assertLessEqual(len(long_entry["snippet"].encode("utf-8")), 200)
+        self.assertLess(len(long_entry["snippet"]), len(long_body))
+
+    def test_index_output_text_mode(self) -> None:
+        code, out, _ = self._run(
+            "index-files",
+            "--path",
+            "docs",
+            "--output",
+            "text",
+        )
+        self.assertEqual(code, EXIT_SUCCESS)
+        with self.assertRaises(json.JSONDecodeError):
+            json.loads(out)
+        self.assertIn("indexed", out)
+
+    # ---- search-files ----
+
+    def test_search_files_returns_hits(self) -> None:
+        # First build the index.
+        self._run("index-files", "--path", "docs")
+        code, out, _ = self._run(
+            "search-files", "--query", "summarize"
+        )
+        self.assertEqual(code, EXIT_SUCCESS, msg=out)
+        payload = json.loads(out)
+        self.assertEqual(payload["stage"], "complete")
+        paths = {h["path"] for h in payload["result"]["hits"]}
+        self.assertIn("docs/alpha.md", paths)
+        self.assertIn("docs/gamma.py", paths)
+        self.assertNotIn("docs/beta.md", paths)
+
+    def test_search_files_text_mode(self) -> None:
+        self._run("index-files", "--path", "docs")
+        code, out, _ = self._run(
+            "search-files",
+            "--query",
+            "summarize",
+            "--output",
+            "text",
+        )
+        self.assertEqual(code, EXIT_SUCCESS)
+        with self.assertRaises(json.JSONDecodeError):
+            json.loads(out)
+        self.assertIn("docs/", out)
+
+    def test_search_files_no_hits_exit_two(self) -> None:
+        self._run("index-files", "--path", "docs")
+        code, out, _ = self._run(
+            "search-files", "--query", "no_such_token_42"
+        )
+        self.assertEqual(code, EXIT_DENIED)
+        payload = json.loads(out)
+        self.assertEqual(payload["stage"], "search")
+        self.assertEqual(payload["result"]["hits"], [])
+
+    def test_search_files_missing_index_fails(self) -> None:
+        code, out, _ = self._run(
+            "search-files", "--query", "anything"
+        )
+        self.assertEqual(code, EXIT_DENIED)
+        payload = json.loads(out)
+        self.assertEqual(payload["stage"], "file_read")
+
+    def test_search_files_query_required(self) -> None:
+        self._run("index-files", "--path", "docs")
+        # argparse raises SystemExit(2) on missing required arg; main()
+        # propagates it.
+        with self.assertRaises(SystemExit) as cm:
+            self._run("search-files")
+        self.assertEqual(cm.exception.code, 2)
+
+
 if __name__ == "__main__":
     unittest.main()
