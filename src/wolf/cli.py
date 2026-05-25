@@ -298,47 +298,71 @@ def cmd_summarize_file(args: argparse.Namespace) -> int:
             output_mode=output_mode,
         )
 
-    # Step 4: wrap the body as UntrustedText (source = local_document) and
-    # route through the LLM_SUMMARIZE pipeline. The Router runs the
-    # prompt-injection scan and quote-for-prompt step before the adapter.
     # Step 4: optionally split the body into chunks and summarize each,
-    # then summarize the joined chunk summaries. The Router still runs
-    # the prompt-injection scan and quote step on every UntrustedText.
-    no_chunk = bool(getattr(args, "no_chunk", False))
-    chunk_size = int(getattr(args, "chunk_size", DEFAULT_CHUNK_SIZE))
-    max_chunks = int(getattr(args, "max_chunks", DEFAULT_MAX_CHUNKS))
+    # then summarize the joined chunk summaries.
+    decision = _summarize_text_via_router(
+        router=router,
+        text=read_result.text,
+        source_path=target_path,
+        encoding=read_result.encoding,
+        byte_size=read_result.byte_size,
+        chunk_size=int(getattr(args, "chunk_size", DEFAULT_CHUNK_SIZE)),
+        max_chunks=int(getattr(args, "max_chunks", DEFAULT_MAX_CHUNKS)),
+        no_chunk=bool(getattr(args, "no_chunk", False)),
+    )
+    return _emit_decision(
+        decision,
+        output_mode=output_mode,
+        include_result=True,
+    )
 
-    text_for_summary: Optional[str] = None
+
+def _summarize_text_via_router(
+    *,
+    router: Router,
+    text: str,
+    source_path: Path,
+    encoding: str,
+    byte_size: int,
+    chunk_size: int,
+    max_chunks: int,
+    no_chunk: bool,
+) -> RouterDecision:
+    """Route text through the Router as one or more LLM_SUMMARIZE actions.
+
+    For text <= chunk_size or when no_chunk is set, sends the whole body
+    in a single call. Otherwise, splits the body, summarizes each chunk,
+    then summarizes the joined chunk summaries. Returns the final
+    RouterDecision with any chunk warnings folded in. If any chunk
+    summarize step is denied, that decision is returned as-is.
+    """
     chunk_warnings: List[str] = []
-
-    if no_chunk or read_result.byte_size <= chunk_size:
-        text_for_summary = read_result.text
+    if no_chunk or byte_size <= chunk_size:
+        text_for_summary = text
     else:
-        split = split_text(
-            read_result.text,
-            chunk_size=chunk_size,
-            max_chunks=max_chunks,
-        )
+        split = split_text(text, chunk_size=chunk_size, max_chunks=max_chunks)
         if split.truncated:
             chunk_warnings.append(
                 f"chunking: truncated after {len(split.chunks)} chunks "
-                f"(file > chunk_size * max_chunks)"
+                f"(input > chunk_size * max_chunks)"
             )
         per_chunk_summaries: List[str] = []
         for idx, chunk in enumerate(split.chunks):
             decision = _summarize_chunk_via_router(
                 router=router,
                 text=chunk,
-                source_ref=f"{target_path}:chunk-{idx + 1}",
+                source_ref=f"{source_path}:chunk-{idx + 1}",
                 byte_size=len(chunk.encode("utf-8")),
-                encoding=read_result.encoding,
+                encoding=encoding,
             )
             if not decision.allowed or not isinstance(decision.result, str):
-                return _emit_decision(
-                    decision,
-                    output_mode=output_mode,
-                    include_result=False,
-                )
+                # Propagate denial to caller as-is (with any chunk-warning
+                # context); the caller decides what to do.
+                if chunk_warnings:
+                    decision = _decision_with_extra_warnings(
+                        decision, chunk_warnings
+                    )
+                return decision
             per_chunk_summaries.append(decision.result)
             chunk_warnings.extend(decision.warnings)
         text_for_summary = "\n\n".join(
@@ -349,25 +373,22 @@ def cmd_summarize_file(args: argparse.Namespace) -> int:
     body = wrap_untrusted(
         text_for_summary,
         SourceKind.LOCAL_DOCUMENT,
-        source_ref=str(target_path),
+        source_ref=str(source_path),
         metadata={
-            "byte_size": str(read_result.byte_size),
-            "encoding": read_result.encoding,
+            "byte_size": str(byte_size),
+            "encoding": encoding,
         },
     )
-    summarize_action = RouterAction(
-        kind=ActionKind.LLM_SUMMARIZE,
-        risk_level=RiskLevel.LOW,
-        body=body,
+    final = router.route(
+        RouterAction(
+            kind=ActionKind.LLM_SUMMARIZE,
+            risk_level=RiskLevel.LOW,
+            body=body,
+        )
     )
-    decision = router.route(summarize_action)
     if chunk_warnings:
-        decision = _decision_with_extra_warnings(decision, chunk_warnings)
-    return _emit_decision(
-        decision,
-        output_mode=output_mode,
-        include_result=True,
-    )
+        final = _decision_with_extra_warnings(final, chunk_warnings)
+    return final
 
 
 def _summarize_chunk_via_router(
@@ -854,6 +875,312 @@ def cmd_search_files(args: argparse.Namespace) -> int:
     return EXIT_SUCCESS
 
 
+def cmd_search_summarize(args: argparse.Namespace) -> int:
+    """Search the index and summarize matching files.
+
+    Pipeline:
+      1. Build LLM adapter, build Router (with warning-allow default unless
+         --strict-prompt-injection).
+      2. Load .wolf/index/files.json (or build it if --build-index).
+      3. Run the keyword search; if zero hits, exit 2.
+      4. For each hit (up to --limit / --max-files), read the file and
+         summarize it via _summarize_text_via_router. Track per-file
+         results and skip reasons.
+      5. If at least one file was successfully summarized, concatenate
+         the per-file summaries and route them through one final
+         LLM_SUMMARIZE for an aggregate result.
+    """
+    from .safety.project_boundary import ProjectBoundaryGuard
+    from .safety.sensitive_paths import SensitivePathGuard
+
+    project_root = Path(args.project_root).resolve()
+    output_mode = getattr(args, "output", "json")
+    strict = bool(getattr(args, "strict_prompt_injection", False))
+    query = getattr(args, "query", None)
+    if not query:
+        sys.stderr.write("wolf cli: --query is required\n")
+        return EXIT_DENIED
+
+    try:
+        llm = _build_llm_from_args(args)
+    except ValueError as exc:
+        sys.stderr.write(f"wolf cli: {exc}\n")
+        return EXIT_DENIED
+
+    router = _build_router(
+        project_root,
+        llm=llm,
+        config=RouterConfig(allow_warning_injection_findings=not strict),
+    )
+
+    # Step 1: locate / build the index.
+    index_path_arg = getattr(args, "index_path", None)
+    index_path = (
+        Path(index_path_arg).resolve()
+        if index_path_arg
+        else default_index_path(project_root)
+    )
+    if not str(index_path).startswith(str(project_root)):
+        sys.stderr.write(
+            "wolf cli: --index-path must be inside --project-root\n"
+        )
+        return EXIT_DENIED
+
+    boundary = ProjectBoundaryGuard(project_root)
+    sensitive = SensitivePathGuard(project_root=project_root)
+    build_index_first = bool(getattr(args, "build_index", False))
+    build_warnings: List[str] = []
+
+    if build_index_first or not index_path.exists():
+        if not build_index_first and not index_path.exists():
+            if output_mode == "text":
+                sys.stderr.write(
+                    f"wolf cli: index not found at {index_path}; "
+                    "rerun with --build-index or run index-files first\n"
+                )
+            else:
+                _print_json(
+                    {
+                        "allowed": False,
+                        "executed": False,
+                        "requires_confirmation": False,
+                        "stage": "file_read",
+                        "reason": "index not found",
+                        "provider_called": False,
+                        "audit_event_id": None,
+                        "failed_checks": ["index: not found"],
+                        "warnings": [],
+                    }
+                )
+            return EXIT_DENIED
+
+        target_dir = Path(getattr(args, "path", None) or project_root)
+        if not target_dir.is_absolute():
+            target_dir = (project_root / target_dir).resolve()
+        # Gate the directory via the Router so the audit log records
+        # the implicit index build.
+        gate = router.route(
+            RouterAction(
+                kind=ActionKind.FILE_READ,
+                risk_level=RiskLevel.LOW,
+                target_path=str(target_dir),
+            )
+        )
+        if not gate.allowed:
+            return _emit_decision(
+                gate, output_mode=output_mode, include_result=False
+            )
+        result = build_index(
+            project_root=project_root,
+            target_dir=target_dir,
+            boundary=boundary,
+            sensitive=sensitive,
+            recursive=not bool(getattr(args, "no_recursive", False)),
+            include=tuple(getattr(args, "include", None) or []) or None,
+            exclude=tuple(getattr(args, "exclude", None) or []) or None,
+            max_files=int(
+                getattr(args, "max_files", INDEX_DEFAULT_MAX_FILES)
+            ),
+            max_bytes_per_file=int(
+                getattr(args, "max_bytes", INDEX_DEFAULT_MAX_BYTES)
+            ),
+        )
+        save_index_json(result.index, index_path)
+        build_warnings.append(
+            f"index: built {result.accepted_count} entries "
+            f"(skipped {result.skipped_count}) at {index_path.relative_to(project_root)}"
+        )
+        index = result.index
+    else:
+        try:
+            index = load_index_json(index_path)
+        except (FileNotFoundError, ValueError) as exc:
+            if output_mode == "text":
+                sys.stderr.write(f"wolf cli: index load failed: {exc}\n")
+            else:
+                _print_json(
+                    {
+                        "allowed": False,
+                        "executed": False,
+                        "requires_confirmation": False,
+                        "stage": "file_read",
+                        "reason": f"index load failed: {exc}",
+                        "provider_called": False,
+                        "audit_event_id": None,
+                        "failed_checks": ["index: load_failed"],
+                        "warnings": build_warnings,
+                    }
+                )
+            return EXIT_DENIED
+
+    # Step 2: search.
+    limit = int(getattr(args, "limit", 5))
+    max_files = int(getattr(args, "max_files", 5))
+    hits = search_index(
+        index,
+        query,
+        project_root=project_root,
+        boundary=boundary,
+        sensitive=sensitive,
+        max_hits=limit,
+    )
+    if not hits:
+        payload = {
+            "allowed": False,
+            "executed": False,
+            "requires_confirmation": False,
+            "stage": "search",
+            "reason": "no hits",
+            "provider_called": False,
+            "audit_event_id": None,
+            "failed_checks": [],
+            "warnings": build_warnings,
+            "result": {"query": query, "hit_count": 0},
+        }
+        if output_mode == "text":
+            sys.stderr.write(f"wolf cli: no hits for {query!r}\n")
+        else:
+            _print_json(payload)
+        return EXIT_DENIED
+
+    # Step 3: per-hit summarize.
+    chunk_size = int(getattr(args, "chunk_size", DEFAULT_CHUNK_SIZE))
+    max_chunks = int(getattr(args, "max_chunks", DEFAULT_MAX_CHUNKS))
+    no_chunk = bool(getattr(args, "no_chunk", False))
+    per_file_summaries: List[str] = []
+    file_records: List[dict] = []
+    warnings: List[str] = list(build_warnings)
+    accepted = 0
+    for hit in hits[:max_files]:
+        full_path = (project_root / hit.path).resolve()
+        # Re-validate boundary + sensitive (search() already did, but be
+        # explicit at the call site).
+        bd = boundary.check(full_path)
+        sd = sensitive.check(full_path)
+        if not bd.allowed or not sd.allowed:
+            warnings.append(
+                f"search-summarize: skipped {hit.path} (gate denied)"
+            )
+            continue
+        try:
+            read_result = read_text_file(
+                full_path,
+                max_bytes=int(
+                    getattr(args, "max_bytes_per_file", FILE_DEFAULT_MAX_BYTES)
+                ),
+            )
+        except FileReadError as exc:
+            warnings.append(
+                f"search-summarize: skipped {hit.path} "
+                f"(file_read: {exc.label})"
+            )
+            continue
+        decision = _summarize_text_via_router(
+            router=router,
+            text=read_result.text,
+            source_path=full_path,
+            encoding=read_result.encoding,
+            byte_size=read_result.byte_size,
+            chunk_size=chunk_size,
+            max_chunks=max_chunks,
+            no_chunk=no_chunk,
+        )
+        if not decision.allowed or not isinstance(decision.result, str):
+            warnings.append(
+                f"search-summarize: skipped {hit.path} "
+                f"(stage={decision.stage})"
+            )
+            continue
+        per_file_summaries.append(f"[{hit.path}]\n{decision.result}")
+        warnings.extend(decision.warnings)
+        file_records.append(
+            {
+                "path": hit.path,
+                "match_count": hit.match_count,
+                "line_number": hit.line_number,
+                "summary_length": len(decision.result),
+            }
+        )
+        accepted += 1
+
+    if accepted == 0:
+        payload = {
+            "allowed": False,
+            "executed": False,
+            "requires_confirmation": False,
+            "stage": "search",
+            "reason": "no files could be summarized",
+            "provider_called": False,
+            "audit_event_id": None,
+            "failed_checks": ["search-summarize: no eligible hits"],
+            "warnings": warnings,
+            "result": {
+                "query": query,
+                "hit_count": len(hits),
+                "summarized_count": 0,
+                "skipped_count": len(hits),
+                "files": [],
+            },
+        }
+        if output_mode == "text":
+            sys.stderr.write(
+                f"wolf cli: {len(hits)} hit(s) but none could be summarized\n"
+            )
+        else:
+            _print_json(payload)
+        return EXIT_DENIED
+
+    # Step 4: final aggregate summary.
+    aggregated_text = "\n\n".join(per_file_summaries)
+    final_body = wrap_untrusted(
+        aggregated_text,
+        SourceKind.LOCAL_DOCUMENT,
+        source_ref=f"search:{query}",
+        metadata={
+            "hit_count": str(len(hits)),
+            "summarized_count": str(accepted),
+        },
+    )
+    final = router.route(
+        RouterAction(
+            kind=ActionKind.LLM_SUMMARIZE,
+            risk_level=RiskLevel.LOW,
+            body=final_body,
+        )
+    )
+    if warnings:
+        final = _decision_with_extra_warnings(final, warnings)
+
+    if output_mode == "text":
+        if final.allowed and isinstance(final.result, str):
+            sys.stdout.write(final.result)
+            if not final.result.endswith("\n"):
+                sys.stdout.write("\n")
+            if final.warnings:
+                sys.stderr.write(
+                    f"wolf cli: {len(final.warnings)} warning(s) during "
+                    f"search-summarize\n"
+                )
+            return EXIT_SUCCESS
+        sys.stderr.write(
+            f"wolf cli: stage={final.stage} reason={final.reason}\n"
+        )
+        return _exit_code_for(final)
+
+    payload = _decision_to_safe_dict(final, include_result=False)
+    payload["result"] = {
+        "query": query,
+        "hit_count": len(hits),
+        "summarized_count": accepted,
+        "skipped_count": len(hits) - accepted,
+        "files": file_records,
+    }
+    if final.allowed and isinstance(final.result, str):
+        payload["result"]["summary"] = final.result
+    _print_json(payload)
+    return _exit_code_for(final)
+
+
 def cmd_check_path(args: argparse.Namespace) -> int:
     project_root = Path(args.project_root).resolve()
     router = _build_router(project_root)
@@ -1209,6 +1536,122 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output format (default: json)",
     )
     sr.set_defaults(func=cmd_search_files)
+
+    ss = sub.add_parser(
+        "search-summarize",
+        help=(
+            "Search the file index for a query, summarize each matching "
+            "file, and produce one aggregate summary"
+        ),
+    )
+    ss.add_argument("--query", required=True, help="Substring to search for")
+    ss.add_argument(
+        "--index-path",
+        default=None,
+        help=(
+            "JSON index path "
+            "(default: <project_root>/.wolf/index/files.json)"
+        ),
+    )
+    ss.add_argument(
+        "--build-index",
+        action="store_true",
+        help=(
+            "Build the index before searching. Implies index-files on "
+            "--path (default: --project-root)."
+        ),
+    )
+    ss.add_argument(
+        "--path",
+        default=None,
+        help=(
+            "Directory to index when --build-index is used "
+            "(default: --project-root)"
+        ),
+    )
+    ss.add_argument(
+        "--no-recursive",
+        action="store_true",
+        help="Pass-through to the index builder when --build-index is set",
+    )
+    ss.add_argument(
+        "--include",
+        action="append",
+        default=None,
+        help="fnmatch pattern (repeatable); used by --build-index",
+    )
+    ss.add_argument(
+        "--exclude",
+        action="append",
+        default=None,
+        help="fnmatch pattern (repeatable); used by --build-index",
+    )
+    ss.add_argument(
+        "--limit",
+        type=int,
+        default=5,
+        help="Maximum search hits to consider (default: 5)",
+    )
+    ss.add_argument(
+        "--max-files",
+        type=int,
+        default=5,
+        help="Maximum hits to summarize (default: 5)",
+    )
+    ss.add_argument(
+        "--max-bytes",
+        type=int,
+        default=INDEX_DEFAULT_MAX_BYTES,
+        help="Per-file size limit for the index builder (default: 1 MiB)",
+    )
+    ss.add_argument(
+        "--max-bytes-per-file",
+        type=int,
+        default=FILE_DEFAULT_MAX_BYTES,
+        help="Per-hit summarize read limit (default: 1 MiB)",
+    )
+    ss.add_argument(
+        "--chunk-size",
+        type=int,
+        default=DEFAULT_CHUNK_SIZE,
+        help=f"Chunk size in bytes (default: {DEFAULT_CHUNK_SIZE})",
+    )
+    ss.add_argument(
+        "--max-chunks",
+        type=int,
+        default=DEFAULT_MAX_CHUNKS,
+        help=f"Maximum chunks per file (default: {DEFAULT_MAX_CHUNKS})",
+    )
+    ss.add_argument(
+        "--no-chunk",
+        action="store_true",
+        help="Disable per-file chunking",
+    )
+    ss.add_argument(
+        "--strict-prompt-injection",
+        action="store_true",
+        help="Block on warning markers in addition to critical markers",
+    )
+    ss.add_argument(
+        "--backend",
+        choices=("fake", "ollama"),
+        default="fake",
+        help="LLM backend (default: fake)",
+    )
+    ss.add_argument("--model", default=None, help="Ollama model name")
+    ss.add_argument("--ollama-url", default=None, help="Ollama server URL")
+    ss.add_argument(
+        "--allow-non-localhost-ollama",
+        action="store_true",
+        help="Permit a non-localhost --ollama-url",
+    )
+    ss.add_argument(
+        "--output",
+        choices=("json", "text"),
+        default="json",
+        help="Output format (default: json)",
+    )
+    ss.set_defaults(func=cmd_search_summarize)
 
     cp = sub.add_parser(
         "check-path",
