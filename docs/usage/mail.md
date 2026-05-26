@@ -22,6 +22,34 @@ the prompt-injection scan runs on it. Mail subcommands run in
 **strict** prompt-injection mode by default — warning-level markers
 also block, not just critical markers.
 
+## Filters
+
+Both `mail-search` and `mail-summarize` accept three pre-filter flags
+that narrow the candidate messages before the search / summary runs.
+All three are case-insensitive substring matches; combining them is
+AND.
+
+- `--filter-subject SUBSTR` — keeps only messages whose `Subject`
+  header contains SUBSTR.
+- `--filter-from SUBSTR` — keeps only messages whose `From` header
+  contains SUBSTR.
+- `--filter-body-contains SUBSTR` — keeps only messages whose body
+  contains SUBSTR.
+
+For `mail-search` these filters are orthogonal to `--query`: the
+filter runs first to drop messages, then the search runs against
+whatever survives. Use this to focus on a thread, sender, or topic
+before running a substring or content match.
+
+For `mail-summarize` the filters cut the set of messages that get
+summarized.
+
+If all messages are dropped by the filters, the CLI exits 2:
+- `mail-search` with empty candidate set → `stage=search`
+  `result.message_count=0`.
+- `mail-summarize` with empty candidate set → `stage=mail_read`
+  `reason="no messages"`.
+
 ## File support
 
 - `.eml` — single message, parsed with Python's `email` package
