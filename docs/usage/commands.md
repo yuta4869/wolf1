@@ -142,6 +142,46 @@ Key flags:
 - `--backend`, `--model`, `--ollama-url`,
   `--allow-non-localhost-ollama`, `--output`.
 
+### `mail-summarize`
+
+Read a local `.eml` or `.mbox` and summarize each message via the
+Router pipeline.
+
+```sh
+python -m wolf.cli mail-summarize --path PATH [options]
+```
+
+Key flags: `--path PATH` (required, `.eml` or `.mbox`), `--limit N`
+(default 10), `--max-bytes N` (default 1 MiB),
+`--backend {fake,ollama}`, `--model NAME`, `--ollama-url`,
+`--allow-non-localhost-ollama`, `--output {json,text}`.
+
+### `mail-search`
+
+Substring search across subject / from / body of local mail.
+
+```sh
+python -m wolf.cli mail-search --path PATH --query TEXT [options]
+```
+
+Key flags: `--path PATH` (required), `--query TEXT` (required),
+`--limit N`, `--max-hits N` (default 10), `--max-bytes N`,
+`--output {json,text}`.
+
+### `mail-draft`
+
+Generate a reply draft. The user instruction is trusted; the mail
+body is treated as `UntrustedText`. No mail is sent.
+
+```sh
+python -m wolf.cli mail-draft --path PATH --instruction TEXT [options]
+```
+
+Key flags: `--path PATH` (required), `--instruction TEXT` (required),
+`--message-index N` (default 0, only used for `.mbox`),
+`--limit N`, `--max-bytes N`, `--backend`, `--model`, `--ollama-url`,
+`--allow-non-localhost-ollama`, `--output {json,text}`.
+
 ### `summarize-email`
 
 Wrap a string as `UntrustedText(source=email)` and route through

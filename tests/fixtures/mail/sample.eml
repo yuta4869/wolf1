@@ -1,0 +1,22 @@
+From: Alice Example <alice@example.invalid>
+To: Bob Example <bob@example.invalid>
+Cc: Carol Example <carol@example.invalid>
+Subject: Quarterly planning meeting
+Date: Tue, 21 May 2026 09:00:00 +0900
+Message-ID: <sample-001@example.invalid>
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+
+Hi team,
+
+Quick reminder that the quarterly planning meeting is on Thursday at 3pm.
+Agenda:
+
+- Q3 priorities
+- Hiring update
+- Budget review
+
+Please bring last quarter's notes.
+
+Thanks,
+Alice

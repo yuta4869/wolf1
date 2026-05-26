@@ -1,0 +1,27 @@
+From: Dora Example <dora@example.invalid>
+To: Bob Example <bob@example.invalid>
+Subject: Spec attached
+Date: Thu, 23 May 2026 10:00:00 +0900
+Message-ID: <attach-001@example.invalid>
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="boundary-string-001"
+
+--boundary-string-001
+Content-Type: text/plain; charset="utf-8"
+
+Hi Bob,
+
+I attached the spec we discussed. Let me know if any part is unclear.
+
+Thanks,
+Dora
+
+--boundary-string-001
+Content-Type: application/octet-stream; name="spec.bin"
+Content-Disposition: attachment; filename="spec.bin"
+Content-Transfer-Encoding: base64
+
+iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNgYAAAAAMAASsJTYQA
+AAAASUVORK5CYII=
+
+--boundary-string-001--

@@ -8,6 +8,12 @@ runs them through a small safety pipeline, and uses a local LLM
 This README documents the **v0.1** release scope. It is what is
 shipped after PR #1 through PR #21.
 
+## v0.2 in progress
+
+- `mail-summarize` / `mail-search` / `mail-draft` for local `.eml`
+  and `.mbox` files (PR #22). Read-only. No Gmail / IMAP / SMTP /
+  send. See [`docs/usage/mail.md`](docs/usage/mail.md).
+
 ## What v0.1 covers
 
 - Read text files under `--project-root` with `ProjectBoundaryGuard`
