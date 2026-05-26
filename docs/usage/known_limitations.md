@@ -66,11 +66,20 @@ documented as out of scope.
 
 ## Integrations
 
-- **No Gmail / mail.** The `summarize-email` command takes a `--text`
-  string and routes it through the email-source-kind code path; it
-  does NOT connect to any mailbox.
+- **No Gmail / IMAP / SMTP / mail send.** v0.2 adds local `.eml`
+  and `.mbox` read / search / draft via `mail-summarize`,
+  `mail-search`, `mail-draft` (PR #22). The original
+  `summarize-email --text "..."` command also remains. None of
+  these connect to any mailbox, send any mail, or save anything to
+  disk. The draft command returns the proposed reply body in
+  JSON; the user is responsible for actually sending it.
+- **No `.msg` (Outlook), PGP / S/MIME, or attachment content
+  extraction.** Mail attachments are flagged with
+  `has_attachments=True` but their bytes are never read into the
+  body. PDF / docx / image content inside attachments is still
+  not parsed.
 - **No calendar.** Task / calendar extraction is described in
-  `CLAUDE.md` as a planned capability but not in v0.1.
+  `CLAUDE.md` as a planned capability but not in v0.1 / v0.2.
 - **No real robot motion.** `robot-preflight` is dry-run only;
   there is no `execute_motion` call in the CLI code path. The
   Router has the structure (preflight stage, audit log) but no

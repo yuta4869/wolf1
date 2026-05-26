@@ -36,6 +36,20 @@ from .files.search import (
     SearchHit,
     search as search_index,
 )
+from .mail.draft import build_draft_prompt, default_subject_for_reply
+from .mail.read_local import (
+    DEFAULT_MAX_BODY_BYTES as MAIL_DEFAULT_MAX_BODY,
+    DEFAULT_MBOX_LIMIT as MAIL_DEFAULT_MBOX_LIMIT,
+    MailReadError,
+    ParsedMail,
+    read_mail_any,
+    read_mbox,
+)
+from .mail.search import (
+    DEFAULT_MAX_HITS as MAIL_SEARCH_DEFAULT_MAX_HITS,
+    MailHit,
+    search_mail,
+)
 from .files.semantic_search import (
     DEFAULT_MAX_HITS as SEMANTIC_DEFAULT_MAX_HITS,
     SemanticHit,
@@ -1723,6 +1737,465 @@ def cmd_search_summarize(args: argparse.Namespace) -> int:
     return _exit_code_for(final)
 
 
+def _gate_mail_path(
+    *,
+    router: Router,
+    path_str: str,
+    output_mode: str,
+) -> Optional[RouterDecision]:
+    """Route the .eml/.mbox path through ProjectBoundary + SensitivePath.
+
+    Returns None on allow; returns the deny RouterDecision on failure
+    so the caller can pass it to _emit_decision.
+    """
+    gate = router.route(
+        RouterAction(
+            kind=ActionKind.FILE_READ,
+            risk_level=RiskLevel.LOW,
+            target_path=path_str,
+        )
+    )
+    if not gate.allowed:
+        return gate
+    return None
+
+
+def _emit_text_warning_count(warnings_count: int) -> None:
+    if warnings_count > 0:
+        sys.stderr.write(
+            f"wolf cli: {warnings_count} warning(s) during operation\n"
+        )
+
+
+def cmd_mail_summarize(args: argparse.Namespace) -> int:
+    project_root = Path(args.project_root).resolve()
+    output_mode = getattr(args, "output", "json")
+    try:
+        llm = _build_llm_from_args(args)
+    except ValueError as exc:
+        sys.stderr.write(f"wolf cli: {exc}\n")
+        return EXIT_DENIED
+    # Mail is more strict by default: warning-level injection markers
+    # block too. Override via --strict-prompt-injection toggle is not
+    # offered for mail in v0.2 (out of scope).
+    router = _build_router(
+        project_root,
+        llm=llm,
+        config=RouterConfig(allow_warning_injection_findings=False),
+    )
+
+    gate = _gate_mail_path(
+        router=router, path_str=args.path, output_mode=output_mode
+    )
+    if gate is not None:
+        return _emit_decision(
+            gate, output_mode=output_mode, include_result=False
+        )
+
+    path = Path(args.path)
+    if not path.is_absolute():
+        path = (project_root / path).resolve()
+    try:
+        result = read_mail_any(
+            path,
+            limit=int(getattr(args, "limit", MAIL_DEFAULT_MBOX_LIMIT)),
+            max_bytes=int(
+                getattr(args, "max_bytes", MAIL_DEFAULT_MAX_BODY)
+            ),
+        )
+    except MailReadError as exc:
+        payload = {
+            "allowed": False,
+            "executed": False,
+            "requires_confirmation": False,
+            "stage": "mail_read",
+            "reason": f"mail_read failed: {exc.label}",
+            "provider_called": False,
+            "audit_event_id": None,
+            "failed_checks": [f"mail_read: {exc.label}"],
+            "warnings": [],
+        }
+        if output_mode == "text":
+            sys.stderr.write(f"wolf cli: mail_read failed: {exc.label}\n")
+        else:
+            _print_json(payload)
+        return EXIT_DENIED
+
+    if not result.messages:
+        payload = {
+            "allowed": False,
+            "executed": False,
+            "requires_confirmation": False,
+            "stage": "mail_read",
+            "reason": "no messages",
+            "provider_called": False,
+            "audit_event_id": None,
+            "failed_checks": [],
+            "warnings": list(result.skipped),
+        }
+        if output_mode == "text":
+            sys.stderr.write("wolf cli: no messages found\n")
+        else:
+            _print_json(payload)
+        return EXIT_DENIED
+
+    summaries: List[dict] = []
+    warnings: List[str] = list(result.skipped)
+    for pm in result.messages:
+        body = wrap_untrusted(
+            pm.body,
+            SourceKind.EMAIL,
+            source_ref=pm.message_id or str(path),
+            metadata={
+                "subject": pm.subject,
+                "from": pm.from_,
+                "byte_size": str(pm.byte_size),
+            },
+        )
+        decision = router.route(
+            RouterAction(
+                kind=ActionKind.LLM_SUMMARIZE_EMAIL,
+                risk_level=RiskLevel.LOW,
+                body=body,
+            )
+        )
+        if not decision.allowed or not isinstance(decision.result, str):
+            warnings.append(
+                f"mail-summarize: skipped {pm.message_id or pm.subject!r} "
+                f"(stage={decision.stage})"
+            )
+            continue
+        summaries.append(
+            {
+                "message_id": pm.message_id,
+                "subject": pm.subject,
+                "from": pm.from_,
+                "date": pm.date,
+                "summary": decision.result,
+                "summary_length": len(decision.result),
+            }
+        )
+        warnings.extend(decision.warnings)
+
+    if not summaries:
+        payload = {
+            "allowed": False,
+            "executed": False,
+            "requires_confirmation": False,
+            "stage": "prompt_injection",
+            "reason": "no messages could be summarized",
+            "provider_called": True,
+            "audit_event_id": None,
+            "failed_checks": ["mail-summarize: no eligible messages"],
+            "warnings": warnings,
+            "result": {
+                "message_count": len(result.messages),
+                "summarized_count": 0,
+                "summaries": [],
+            },
+        }
+        if output_mode == "text":
+            sys.stderr.write(
+                f"wolf cli: {len(result.messages)} message(s) read but none "
+                "could be summarized\n"
+            )
+        else:
+            _print_json(payload)
+        return EXIT_DENIED
+
+    if output_mode == "text":
+        for s in summaries:
+            sys.stdout.write(
+                f"[{s['subject']}] {s['summary']}\n"
+            )
+        _emit_text_warning_count(len(warnings))
+        return EXIT_SUCCESS
+
+    _print_json(
+        {
+            "allowed": True,
+            "executed": True,
+            "requires_confirmation": False,
+            "stage": "complete",
+            "reason": f"{len(summaries)} message(s) summarized",
+            "provider_called": True,
+            "audit_event_id": None,
+            "failed_checks": [],
+            "warnings": warnings,
+            "result": {
+                "message_count": len(result.messages),
+                "summarized_count": len(summaries),
+                "summaries": summaries,
+            },
+        }
+    )
+    return EXIT_SUCCESS
+
+
+def cmd_mail_search(args: argparse.Namespace) -> int:
+    project_root = Path(args.project_root).resolve()
+    output_mode = getattr(args, "output", "json")
+    query = getattr(args, "query", None)
+    if not query:
+        sys.stderr.write("wolf cli: --query is required\n")
+        return EXIT_DENIED
+
+    # Build router only so the path gate + audit log run.
+    try:
+        llm = _build_llm_from_args(args)
+    except ValueError as exc:
+        sys.stderr.write(f"wolf cli: {exc}\n")
+        return EXIT_DENIED
+    router = _build_router(project_root, llm=llm)
+    gate = _gate_mail_path(
+        router=router, path_str=args.path, output_mode=output_mode
+    )
+    if gate is not None:
+        return _emit_decision(
+            gate, output_mode=output_mode, include_result=False
+        )
+
+    path = Path(args.path)
+    if not path.is_absolute():
+        path = (project_root / path).resolve()
+    try:
+        result = read_mail_any(
+            path,
+            limit=int(getattr(args, "limit", MAIL_DEFAULT_MBOX_LIMIT)),
+            max_bytes=int(
+                getattr(args, "max_bytes", MAIL_DEFAULT_MAX_BODY)
+            ),
+        )
+    except MailReadError as exc:
+        if output_mode == "text":
+            sys.stderr.write(f"wolf cli: mail_read failed: {exc.label}\n")
+        else:
+            _print_json(
+                {
+                    "allowed": False,
+                    "executed": False,
+                    "requires_confirmation": False,
+                    "stage": "mail_read",
+                    "reason": f"mail_read failed: {exc.label}",
+                    "provider_called": False,
+                    "audit_event_id": None,
+                    "failed_checks": [f"mail_read: {exc.label}"],
+                    "warnings": [],
+                }
+            )
+        return EXIT_DENIED
+
+    max_hits = int(
+        getattr(args, "max_hits", MAIL_SEARCH_DEFAULT_MAX_HITS)
+    )
+    hits = search_mail(result.messages, query, max_hits=max_hits)
+
+    if not hits:
+        payload = {
+            "allowed": False,
+            "executed": False,
+            "requires_confirmation": False,
+            "stage": "search",
+            "reason": "no hits",
+            "provider_called": False,
+            "audit_event_id": None,
+            "failed_checks": [],
+            "warnings": list(result.skipped),
+            "result": {"query": query, "hits": [], "message_count": len(result.messages)},
+        }
+        if output_mode == "text":
+            sys.stderr.write(f"wolf cli: no mail hits for {query!r}\n")
+        else:
+            _print_json(payload)
+        return EXIT_DENIED
+
+    if output_mode == "text":
+        for h in hits:
+            sys.stdout.write(
+                f"[{h.match_field}] {h.subject} <{h.from_}>: "
+                f"{h.snippet.replace(chr(10), ' ')}\n"
+            )
+        _emit_text_warning_count(len(result.skipped))
+        return EXIT_SUCCESS
+
+    _print_json(
+        {
+            "allowed": True,
+            "executed": True,
+            "requires_confirmation": False,
+            "stage": "complete",
+            "reason": f"{len(hits)} mail hit(s)",
+            "provider_called": False,
+            "audit_event_id": None,
+            "failed_checks": [],
+            "warnings": list(result.skipped),
+            "result": {
+                "query": query,
+                "message_count": len(result.messages),
+                "hits": [
+                    {
+                        "subject": h.subject,
+                        "from": h.from_,
+                        "date": h.date,
+                        "message_id": h.message_id,
+                        "snippet": h.snippet,
+                        "match_field": h.match_field,
+                        "match_count": h.match_count,
+                    }
+                    for h in hits
+                ],
+            },
+        }
+    )
+    return EXIT_SUCCESS
+
+
+def cmd_mail_draft(args: argparse.Namespace) -> int:
+    project_root = Path(args.project_root).resolve()
+    output_mode = getattr(args, "output", "json")
+    instruction = getattr(args, "instruction", None)
+    if not instruction or not instruction.strip():
+        sys.stderr.write("wolf cli: --instruction is required\n")
+        return EXIT_DENIED
+
+    try:
+        llm = _build_llm_from_args(args)
+    except ValueError as exc:
+        sys.stderr.write(f"wolf cli: {exc}\n")
+        return EXIT_DENIED
+    # Mail draft: strict (warning markers block). The mail body is
+    # untrusted; the user instruction is trusted but routed through the
+    # same prompt-injection scan via UntrustedText wrap of the mail.
+    router = _build_router(
+        project_root,
+        llm=llm,
+        config=RouterConfig(allow_warning_injection_findings=False),
+    )
+
+    gate = _gate_mail_path(
+        router=router, path_str=args.path, output_mode=output_mode
+    )
+    if gate is not None:
+        return _emit_decision(
+            gate, output_mode=output_mode, include_result=False
+        )
+
+    path = Path(args.path)
+    if not path.is_absolute():
+        path = (project_root / path).resolve()
+    try:
+        result = read_mail_any(
+            path,
+            limit=int(getattr(args, "limit", MAIL_DEFAULT_MBOX_LIMIT)),
+            max_bytes=int(
+                getattr(args, "max_bytes", MAIL_DEFAULT_MAX_BODY)
+            ),
+        )
+    except MailReadError as exc:
+        if output_mode == "text":
+            sys.stderr.write(f"wolf cli: mail_read failed: {exc.label}\n")
+        else:
+            _print_json(
+                {
+                    "allowed": False,
+                    "executed": False,
+                    "requires_confirmation": False,
+                    "stage": "mail_read",
+                    "reason": f"mail_read failed: {exc.label}",
+                    "provider_called": False,
+                    "audit_event_id": None,
+                    "failed_checks": [f"mail_read: {exc.label}"],
+                    "warnings": [],
+                }
+            )
+        return EXIT_DENIED
+
+    msg_index = int(getattr(args, "message_index", 0))
+    if msg_index < 0 or msg_index >= len(result.messages):
+        if output_mode == "text":
+            sys.stderr.write(
+                f"wolf cli: --message-index {msg_index} out of range "
+                f"(0..{len(result.messages) - 1})\n"
+            )
+        else:
+            _print_json(
+                {
+                    "allowed": False,
+                    "executed": False,
+                    "requires_confirmation": False,
+                    "stage": "mail_read",
+                    "reason": "message_index out of range",
+                    "provider_called": False,
+                    "audit_event_id": None,
+                    "failed_checks": [
+                        f"mail-draft: index {msg_index} of {len(result.messages)}"
+                    ],
+                    "warnings": list(result.skipped),
+                }
+            )
+        return EXIT_DENIED
+
+    pm = result.messages[msg_index]
+    parts = build_draft_prompt(pm, instruction)
+    # The Router sees the composed prompt (instruction + mail body
+    # boundary text) wrapped as UntrustedText so the prompt-injection
+    # scan applies to the mail content.
+    composed = parts.composed + parts.mail_body
+    body = wrap_untrusted(
+        composed,
+        SourceKind.EMAIL,
+        source_ref=pm.message_id or str(path),
+        metadata={
+            "subject": pm.subject,
+            "from": pm.from_,
+            "byte_size": str(pm.byte_size),
+        },
+    )
+    decision = router.route(
+        RouterAction(
+            kind=ActionKind.LLM_SUMMARIZE_EMAIL,
+            risk_level=RiskLevel.LOW,
+            body=body,
+        )
+    )
+
+    if not decision.allowed or not isinstance(decision.result, str):
+        return _emit_decision(
+            decision, output_mode=output_mode, include_result=False
+        )
+
+    subject_suggestion = default_subject_for_reply(pm.subject)
+    if output_mode == "text":
+        sys.stdout.write(decision.result)
+        if not decision.result.endswith("\n"):
+            sys.stdout.write("\n")
+        _emit_text_warning_count(len(decision.warnings))
+        return EXIT_SUCCESS
+
+    _print_json(
+        {
+            "allowed": True,
+            "executed": True,
+            "requires_confirmation": False,
+            "stage": "complete",
+            "reason": "draft generated",
+            "provider_called": True,
+            "audit_event_id": None,
+            "failed_checks": [],
+            "warnings": list(decision.warnings),
+            "result": {
+                "source_subject": pm.subject,
+                "source_from": pm.from_,
+                "source_message_id": pm.message_id,
+                "subject_suggestion": subject_suggestion,
+                "body": decision.result,
+                "body_length": len(decision.result),
+            },
+        }
+    )
+    return EXIT_SUCCESS
+
+
 def cmd_check_path(args: argparse.Namespace) -> int:
     project_root = Path(args.project_root).resolve()
     router = _build_router(project_root)
@@ -2311,6 +2784,132 @@ def build_parser() -> argparse.ArgumentParser:
         help="Ollama server URL for embeddings",
     )
     ss.set_defaults(func=cmd_search_summarize)
+
+    ms = sub.add_parser(
+        "mail-summarize",
+        help=(
+            "Read a local .eml or .mbox and summarize each message via "
+            "the selected LLM backend"
+        ),
+    )
+    ms.add_argument("--path", required=True, help=".eml or .mbox file")
+    ms.add_argument(
+        "--limit",
+        type=int,
+        default=MAIL_DEFAULT_MBOX_LIMIT,
+        help=f"Max messages to read from .mbox (default: {MAIL_DEFAULT_MBOX_LIMIT})",
+    )
+    ms.add_argument(
+        "--max-bytes",
+        type=int,
+        default=MAIL_DEFAULT_MAX_BODY,
+        help="Per-message body size cap (default: 1 MiB)",
+    )
+    ms.add_argument(
+        "--backend",
+        choices=("fake", "ollama"),
+        default="fake",
+        help="LLM backend (default: fake)",
+    )
+    ms.add_argument("--model", default=None, help="Ollama model name")
+    ms.add_argument("--ollama-url", default=None, help="Ollama server URL")
+    ms.add_argument(
+        "--allow-non-localhost-ollama",
+        action="store_true",
+        help="Permit a non-localhost --ollama-url",
+    )
+    ms.add_argument(
+        "--output",
+        choices=("json", "text"),
+        default="json",
+        help="Output format (default: json)",
+    )
+    ms.set_defaults(func=cmd_mail_summarize)
+
+    msr = sub.add_parser(
+        "mail-search",
+        help="Substring search across subject / from / body of local mail",
+    )
+    msr.add_argument("--path", required=True, help=".eml or .mbox file")
+    msr.add_argument("--query", required=True, help="Substring to search for")
+    msr.add_argument(
+        "--limit",
+        type=int,
+        default=MAIL_DEFAULT_MBOX_LIMIT,
+        help="Max messages to scan from .mbox (default: 10)",
+    )
+    msr.add_argument(
+        "--max-hits",
+        type=int,
+        default=MAIL_SEARCH_DEFAULT_MAX_HITS,
+        help="Maximum hits to return (default: 10)",
+    )
+    msr.add_argument(
+        "--max-bytes",
+        type=int,
+        default=MAIL_DEFAULT_MAX_BODY,
+        help="Per-message body size cap (default: 1 MiB)",
+    )
+    msr.add_argument(
+        "--output",
+        choices=("json", "text"),
+        default="json",
+        help="Output format (default: json)",
+    )
+    msr.set_defaults(func=cmd_mail_search)
+
+    md = sub.add_parser(
+        "mail-draft",
+        help=(
+            "Generate a reply draft for a local mail message. The user "
+            "instruction is trusted; the mail body is treated as "
+            "UntrustedText. No mail is sent."
+        ),
+    )
+    md.add_argument("--path", required=True, help=".eml or .mbox file")
+    md.add_argument(
+        "--instruction",
+        required=True,
+        help="Trusted instruction describing the reply to compose",
+    )
+    md.add_argument(
+        "--message-index",
+        type=int,
+        default=0,
+        help="0-based index into an .mbox (default: 0; for .eml ignored)",
+    )
+    md.add_argument(
+        "--limit",
+        type=int,
+        default=MAIL_DEFAULT_MBOX_LIMIT,
+        help="Max messages to scan from .mbox before indexing (default: 10)",
+    )
+    md.add_argument(
+        "--max-bytes",
+        type=int,
+        default=MAIL_DEFAULT_MAX_BODY,
+        help="Per-message body size cap (default: 1 MiB)",
+    )
+    md.add_argument(
+        "--backend",
+        choices=("fake", "ollama"),
+        default="fake",
+        help="LLM backend (default: fake)",
+    )
+    md.add_argument("--model", default=None, help="Ollama model name")
+    md.add_argument("--ollama-url", default=None, help="Ollama server URL")
+    md.add_argument(
+        "--allow-non-localhost-ollama",
+        action="store_true",
+        help="Permit a non-localhost --ollama-url",
+    )
+    md.add_argument(
+        "--output",
+        choices=("json", "text"),
+        default="json",
+        help="Output format (default: json)",
+    )
+    md.set_defaults(func=cmd_mail_draft)
 
     cp = sub.add_parser(
         "check-path",

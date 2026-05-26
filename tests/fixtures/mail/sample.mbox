@@ -1,0 +1,44 @@
+From alice@example.invalid Tue May 21 09:00:00 2026
+From: Alice Example <alice@example.invalid>
+To: Bob Example <bob@example.invalid>
+Subject: Quarterly planning meeting
+Date: Tue, 21 May 2026 09:00:00 +0900
+Message-ID: <mbox-001@example.invalid>
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+
+Hi team,
+
+Reminder: the quarterly planning meeting is on Thursday at 3pm.
+Please bring last quarter's notes.
+
+Thanks,
+Alice
+
+From bob@example.invalid Tue May 21 17:00:00 2026
+From: Bob Example <bob@example.invalid>
+To: Alice Example <alice@example.invalid>
+Subject: Re: Quarterly planning meeting
+Date: Tue, 21 May 2026 17:00:00 +0900
+Message-ID: <mbox-002@example.invalid>
+In-Reply-To: <mbox-001@example.invalid>
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+
+Got it. I'll bring the Q2 review deck.
+
+Bob
+
+From carol@example.invalid Wed May 22 08:00:00 2026
+From: Carol Example <carol@example.invalid>
+To: Bob Example <bob@example.invalid>
+Subject: Lunch on Friday?
+Date: Wed, 22 May 2026 08:00:00 +0900
+Message-ID: <mbox-003@example.invalid>
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+
+Are you free for lunch on Friday? There's a new place near the office.
+
+Carol
+

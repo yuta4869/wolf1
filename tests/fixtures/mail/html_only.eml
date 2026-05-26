@@ -1,0 +1,19 @@
+From: Newsletter <news@example.invalid>
+To: Bob Example <bob@example.invalid>
+Subject: This week in widgets
+Date: Wed, 22 May 2026 12:00:00 +0900
+Message-ID: <html-001@example.invalid>
+MIME-Version: 1.0
+Content-Type: text/html; charset="utf-8"
+
+<html>
+<body>
+<h1>Widget weekly</h1>
+<p>This week we launched the <b>blue widget</b>.</p>
+<p>Read more at <a href="https://example.invalid/blog">the blog</a>.</p>
+<ul>
+<li>Item one</li>
+<li>Item two</li>
+</ul>
+</body>
+</html>
