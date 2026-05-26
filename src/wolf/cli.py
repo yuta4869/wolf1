@@ -1876,6 +1876,16 @@ def cmd_mail_summarize(args: argparse.Namespace) -> int:
                 "date": pm.date,
                 "summary": decision.result,
                 "summary_length": len(decision.result),
+                "has_attachments": pm.has_attachments,
+                "attachments_count": len(pm.attachments),
+                "attachments": [
+                    {
+                        "filename": a.filename,
+                        "content_type": a.content_type,
+                        "size_bytes": a.size_bytes,
+                    }
+                    for a in pm.attachments
+                ],
             }
         )
         warnings.extend(decision.warnings)
@@ -2047,6 +2057,8 @@ def cmd_mail_search(args: argparse.Namespace) -> int:
                         "snippet": h.snippet,
                         "match_field": h.match_field,
                         "match_count": h.match_count,
+                        "has_attachments": h.has_attachments,
+                        "attachments_count": h.attachments_count,
                     }
                     for h in hits
                 ],
@@ -2120,6 +2132,26 @@ def cmd_mail_draft(args: argparse.Namespace) -> int:
         return EXIT_DENIED
 
     msg_index = int(getattr(args, "message_index", 0))
+    if not result.messages:
+        if output_mode == "text":
+            sys.stderr.write(
+                "wolf cli: no messages match the filters\n"
+            )
+        else:
+            _print_json(
+                {
+                    "allowed": False,
+                    "executed": False,
+                    "requires_confirmation": False,
+                    "stage": "mail_read",
+                    "reason": "no messages",
+                    "provider_called": False,
+                    "audit_event_id": None,
+                    "failed_checks": ["mail-draft: no messages after filters"],
+                    "warnings": list(result.skipped),
+                }
+            )
+        return EXIT_DENIED
     if msg_index < 0 or msg_index >= len(result.messages):
         if output_mode == "text":
             sys.stderr.write(
@@ -2196,6 +2228,8 @@ def cmd_mail_draft(args: argparse.Namespace) -> int:
                 "source_subject": pm.subject,
                 "source_from": pm.from_,
                 "source_message_id": pm.message_id,
+                "source_has_attachments": pm.has_attachments,
+                "source_attachments_count": len(pm.attachments),
                 "subject_suggestion": subject_suggestion,
                 "body": decision.result,
                 "body_length": len(decision.result),
@@ -2829,25 +2863,31 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ms.add_argument(
         "--filter-subject",
+        action="append",
         default=None,
         help=(
             "Case-insensitive substring filter on the Subject header. "
-            "Messages whose subject does not contain this string are "
-            "skipped before summarization."
+            "Repeat to OR-combine: --filter-subject Lunch "
+            "--filter-subject Meeting keeps subjects containing either. "
+            "Different filter kinds are AND-combined."
         ),
     )
     ms.add_argument(
         "--filter-from",
+        action="append",
         default=None,
         help=(
-            "Case-insensitive substring filter on the From header."
+            "Case-insensitive substring filter on the From header. "
+            "Repeatable (OR within --filter-from)."
         ),
     )
     ms.add_argument(
         "--filter-body-contains",
+        action="append",
         default=None,
         help=(
-            "Case-insensitive substring filter on the message body."
+            "Case-insensitive substring filter on the message body. "
+            "Repeatable (OR within --filter-body-contains)."
         ),
     )
     ms.add_argument(
@@ -2884,21 +2924,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     msr.add_argument(
         "--filter-subject",
+        action="append",
         default=None,
         help=(
             "Pre-filter mailbox messages by Subject substring before "
-            "running the --query search."
+            "running the --query search. Repeatable (OR)."
         ),
     )
     msr.add_argument(
         "--filter-from",
+        action="append",
         default=None,
-        help="Pre-filter mailbox messages by From substring.",
+        help="Pre-filter by From substring. Repeatable (OR).",
     )
     msr.add_argument(
         "--filter-body-contains",
+        action="append",
         default=None,
-        help="Pre-filter mailbox messages by body substring.",
+        help="Pre-filter by body substring. Repeatable (OR).",
     )
     msr.add_argument(
         "--output",
@@ -2952,6 +2995,34 @@ def build_parser() -> argparse.ArgumentParser:
         "--allow-non-localhost-ollama",
         action="store_true",
         help="Permit a non-localhost --ollama-url",
+    )
+    md.add_argument(
+        "--filter-subject",
+        action="append",
+        default=None,
+        help=(
+            "Narrow .mbox / Maildir messages by Subject substring before "
+            "--message-index is applied. Repeatable (OR). For .eml a "
+            "mismatch exits 2."
+        ),
+    )
+    md.add_argument(
+        "--filter-from",
+        action="append",
+        default=None,
+        help=(
+            "Narrow by From substring before --message-index. "
+            "Repeatable (OR)."
+        ),
+    )
+    md.add_argument(
+        "--filter-body-contains",
+        action="append",
+        default=None,
+        help=(
+            "Narrow by body substring before --message-index. "
+            "Repeatable (OR)."
+        ),
     )
     md.add_argument(
         "--output",

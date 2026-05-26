@@ -1,0 +1,12 @@
+From: Bob Example <bob@example.invalid>
+To: Alice Example <alice@example.invalid>
+Subject: Re: Maildir meeting agenda
+Date: Tue, 21 May 2026 17:00:00 +0900
+Message-ID: <maildir-002@example.invalid>
+In-Reply-To: <maildir-001@example.invalid>
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+
+Got it. I'll bring the Q2 review deck.
+
+Bob

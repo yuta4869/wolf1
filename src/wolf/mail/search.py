@@ -26,6 +26,8 @@ class MailHit:
     snippet: str
     match_field: str  # "subject" / "from" / "body"
     match_count: int
+    has_attachments: bool = False
+    attachments_count: int = 0
 
 
 def _make_snippet(text: str, query: str, *, context_bytes: int) -> str:
@@ -91,6 +93,8 @@ def search_mail(
                 snippet=snippet,
                 match_field=match_field,
                 match_count=match_count,
+                has_attachments=pm.has_attachments,
+                attachments_count=len(pm.attachments),
             )
         )
     return hits

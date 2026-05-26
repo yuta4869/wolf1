@@ -74,8 +74,8 @@ documented as out of scope.
   disk. The draft command returns the proposed reply body in
   JSON; the user is responsible for actually sending it.
 - **No `.msg` (Outlook), PGP / S/MIME, or attachment content
-  extraction.** Mail attachments are flagged with
-  `has_attachments=True` but their bytes are never read into the
+  extraction.** Mail attachments carry filename / content_type /
+  size_bytes metadata only; their bytes are never read into the
   body. PDF / docx / image content inside attachments is still
   not parsed.
 - **No calendar.** Task / calendar extraction is described in

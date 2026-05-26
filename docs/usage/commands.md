@@ -151,13 +151,16 @@ Router pipeline.
 python -m wolf.cli mail-summarize --path PATH [options]
 ```
 
-Key flags: `--path PATH` (required, `.eml` or `.mbox`), `--limit N`
-(default 10), `--max-bytes N` (default 1 MiB),
-`--filter-subject SUBSTR`, `--filter-from SUBSTR`,
-`--filter-body-contains SUBSTR` (pre-filter messages before
-summarizing; case-insensitive substring; combine with AND),
+Key flags: `--path PATH` (required, `.eml`, `.mbox`, or Maildir
+directory), `--limit N` (default 10), `--max-bytes N` (default 1
+MiB), `--filter-subject SUBSTR`, `--filter-from SUBSTR`,
+`--filter-body-contains SUBSTR` (pre-filter messages; repeatable
+to OR-combine within a kind; different kinds AND-combine),
 `--backend {fake,ollama}`, `--model NAME`, `--ollama-url`,
-`--allow-non-localhost-ollama`, `--output {json,text}`.
+`--allow-non-localhost-ollama`, `--output {json,text}`. JSON output
+under `result.summaries[]` carries `has_attachments`,
+`attachments_count`, and a per-attachment `attachments` array with
+`filename`, `content_type`, `size_bytes`.
 
 ### `mail-search`
 
@@ -167,12 +170,13 @@ Substring search across subject / from / body of local mail.
 python -m wolf.cli mail-search --path PATH --query TEXT [options]
 ```
 
-Key flags: `--path PATH` (required), `--query TEXT` (required),
-`--limit N`, `--max-hits N` (default 10), `--max-bytes N`,
-`--filter-subject SUBSTR`, `--filter-from SUBSTR`,
-`--filter-body-contains SUBSTR` (pre-filter messages before search;
-combine with AND; orthogonal to `--query`),
-`--output {json,text}`.
+Key flags: `--path PATH` (required, `.eml`, `.mbox`, or Maildir
+directory), `--query TEXT` (required), `--limit N`, `--max-hits N`
+(default 10), `--max-bytes N`, `--filter-subject SUBSTR`,
+`--filter-from SUBSTR`, `--filter-body-contains SUBSTR` (repeatable
+to OR-combine within a kind; AND across kinds; orthogonal to
+`--query`), `--output {json,text}`. Each `result.hits[]` entry
+carries `has_attachments` and `attachments_count`.
 
 ### `mail-draft`
 
@@ -183,10 +187,14 @@ body is treated as `UntrustedText`. No mail is sent.
 python -m wolf.cli mail-draft --path PATH --instruction TEXT [options]
 ```
 
-Key flags: `--path PATH` (required), `--instruction TEXT` (required),
-`--message-index N` (default 0, only used for `.mbox`),
-`--limit N`, `--max-bytes N`, `--backend`, `--model`, `--ollama-url`,
-`--allow-non-localhost-ollama`, `--output {json,text}`.
+Key flags: `--path PATH` (required, `.eml`, `.mbox`, or Maildir
+directory), `--instruction TEXT` (required), `--message-index N`
+(default 0; applied to filtered list), `--limit N`, `--max-bytes N`,
+`--filter-subject SUBSTR`, `--filter-from SUBSTR`,
+`--filter-body-contains SUBSTR` (repeatable; same semantics as
+mail-search), `--backend`, `--model`, `--ollama-url`,
+`--allow-non-localhost-ollama`, `--output {json,text}`. JSON `result`
+carries `source_has_attachments` and `source_attachments_count`.
 
 ### `summarize-email`
 
