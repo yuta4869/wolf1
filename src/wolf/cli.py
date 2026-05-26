@@ -1802,6 +1802,9 @@ def cmd_mail_summarize(args: argparse.Namespace) -> int:
             max_bytes=int(
                 getattr(args, "max_bytes", MAIL_DEFAULT_MAX_BODY)
             ),
+            filter_subject=getattr(args, "filter_subject", None) or None,
+            filter_from=getattr(args, "filter_from", None) or None,
+            filter_body_contains=getattr(args, "filter_body_contains", None) or None,
         )
     except MailReadError as exc:
         payload = {
@@ -1965,6 +1968,9 @@ def cmd_mail_search(args: argparse.Namespace) -> int:
             max_bytes=int(
                 getattr(args, "max_bytes", MAIL_DEFAULT_MAX_BODY)
             ),
+            filter_subject=getattr(args, "filter_subject", None) or None,
+            filter_from=getattr(args, "filter_from", None) or None,
+            filter_body_contains=getattr(args, "filter_body_contains", None) or None,
         )
     except MailReadError as exc:
         if output_mode == "text":
@@ -2090,6 +2096,9 @@ def cmd_mail_draft(args: argparse.Namespace) -> int:
             max_bytes=int(
                 getattr(args, "max_bytes", MAIL_DEFAULT_MAX_BODY)
             ),
+            filter_subject=getattr(args, "filter_subject", None) or None,
+            filter_from=getattr(args, "filter_from", None) or None,
+            filter_body_contains=getattr(args, "filter_body_contains", None) or None,
         )
     except MailReadError as exc:
         if output_mode == "text":
@@ -2819,6 +2828,29 @@ def build_parser() -> argparse.ArgumentParser:
         help="Permit a non-localhost --ollama-url",
     )
     ms.add_argument(
+        "--filter-subject",
+        default=None,
+        help=(
+            "Case-insensitive substring filter on the Subject header. "
+            "Messages whose subject does not contain this string are "
+            "skipped before summarization."
+        ),
+    )
+    ms.add_argument(
+        "--filter-from",
+        default=None,
+        help=(
+            "Case-insensitive substring filter on the From header."
+        ),
+    )
+    ms.add_argument(
+        "--filter-body-contains",
+        default=None,
+        help=(
+            "Case-insensitive substring filter on the message body."
+        ),
+    )
+    ms.add_argument(
         "--output",
         choices=("json", "text"),
         default="json",
@@ -2849,6 +2881,24 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=MAIL_DEFAULT_MAX_BODY,
         help="Per-message body size cap (default: 1 MiB)",
+    )
+    msr.add_argument(
+        "--filter-subject",
+        default=None,
+        help=(
+            "Pre-filter mailbox messages by Subject substring before "
+            "running the --query search."
+        ),
+    )
+    msr.add_argument(
+        "--filter-from",
+        default=None,
+        help="Pre-filter mailbox messages by From substring.",
+    )
+    msr.add_argument(
+        "--filter-body-contains",
+        default=None,
+        help="Pre-filter mailbox messages by body substring.",
     )
     msr.add_argument(
         "--output",

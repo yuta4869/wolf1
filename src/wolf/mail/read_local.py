@@ -306,25 +306,70 @@ def read_mbox(
     return MboxReadResult(messages=tuple(parsed), skipped=tuple(skipped))
 
 
+def _eml_passes_filters(
+    pm: ParsedMail,
+    *,
+    filter_subject: Optional[str],
+    filter_from: Optional[str],
+    filter_body_contains: Optional[str],
+) -> bool:
+    if filter_subject and filter_subject.lower() not in pm.subject.lower():
+        return False
+    if filter_from and filter_from.lower() not in pm.from_.lower():
+        return False
+    if (
+        filter_body_contains
+        and filter_body_contains.lower() not in pm.body.lower()
+    ):
+        return False
+    return True
+
+
 def read_mail_any(
     path: Path,
     *,
     limit: int = DEFAULT_MBOX_LIMIT,
     max_bytes: int = DEFAULT_MAX_BODY_BYTES,
+    filter_subject: Optional[str] = None,
+    filter_from: Optional[str] = None,
+    filter_body_contains: Optional[str] = None,
 ) -> MboxReadResult:
     """Convenience: auto-detect .eml vs .mbox by extension.
 
     Returns a MboxReadResult in both cases; for a single .eml the
-    `messages` tuple has length 1.
+    `messages` tuple has length 1 (or 0 if filters drop the message).
     """
     if not isinstance(path, Path):
         path = Path(path)
     suffix = path.suffix.lower()
     if suffix == ".mbox":
-        return read_mbox(path, limit=limit, max_bytes=max_bytes)
+        return read_mbox(
+            path,
+            limit=limit,
+            max_bytes=max_bytes,
+            filter_subject=filter_subject,
+            filter_from=filter_from,
+            filter_body_contains=filter_body_contains,
+        )
     if suffix == ".eml" or suffix == "":
         pm = read_eml(path, max_bytes=max_bytes)
+        if not _eml_passes_filters(
+            pm,
+            filter_subject=filter_subject,
+            filter_from=filter_from,
+            filter_body_contains=filter_body_contains,
+        ):
+            return MboxReadResult(messages=())
         return MboxReadResult(messages=(pm,))
     # Unknown extension — try .eml semantics.
     pm = read_eml(path, max_bytes=max_bytes)
+    if not _eml_passes_filters(
+        pm,
+        filter_subject=filter_subject,
+        filter_from=filter_from,
+        filter_body_contains=filter_body_contains,
+    ):
+        return MboxReadResult(messages=())
     return MboxReadResult(messages=(pm,))
+
+

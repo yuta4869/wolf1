@@ -153,6 +153,9 @@ python -m wolf.cli mail-summarize --path PATH [options]
 
 Key flags: `--path PATH` (required, `.eml` or `.mbox`), `--limit N`
 (default 10), `--max-bytes N` (default 1 MiB),
+`--filter-subject SUBSTR`, `--filter-from SUBSTR`,
+`--filter-body-contains SUBSTR` (pre-filter messages before
+summarizing; case-insensitive substring; combine with AND),
 `--backend {fake,ollama}`, `--model NAME`, `--ollama-url`,
 `--allow-non-localhost-ollama`, `--output {json,text}`.
 
@@ -166,6 +169,9 @@ python -m wolf.cli mail-search --path PATH --query TEXT [options]
 
 Key flags: `--path PATH` (required), `--query TEXT` (required),
 `--limit N`, `--max-hits N` (default 10), `--max-bytes N`,
+`--filter-subject SUBSTR`, `--filter-from SUBSTR`,
+`--filter-body-contains SUBSTR` (pre-filter messages before search;
+combine with AND; orthogonal to `--query`),
 `--output {json,text}`.
 
 ### `mail-draft`

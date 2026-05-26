@@ -2473,5 +2473,136 @@ class MailCliTest(unittest.TestCase):
         self.assertEqual(payload["result"]["body"], "ollama-draft-body")
 
 
+class MailCliFilterTest(unittest.TestCase):
+    """PR #23: --filter-subject / --filter-from / --filter-body-contains."""
+
+    def setUp(self) -> None:
+        self.fixture = _ProjectFixture()
+        import shutil
+
+        src_fixtures = REPO_ROOT / "tests" / "fixtures" / "mail"
+        dst = self.fixture.root / "mail"
+        dst.mkdir()
+        for name in ("sample.eml", "sample.mbox"):
+            shutil.copy(src_fixtures / name, dst / name)
+
+    def tearDown(self) -> None:
+        self.fixture.cleanup()
+
+    def _run(self, *extra_args: str):
+        return _run_inproc(
+            [
+                "--project-root",
+                str(self.fixture.root),
+                *extra_args,
+            ]
+        )
+
+    # ---- mail-search filters ----
+
+    def test_search_filter_from_narrows_results(self) -> None:
+        code, out, _ = self._run(
+            "mail-search",
+            "--path", "mail/sample.mbox",
+            "--query", "Lunch",
+            "--filter-from", "carol",
+        )
+        self.assertEqual(code, EXIT_SUCCESS, msg=out)
+        payload = json.loads(out)
+        hits = payload["result"]["hits"]
+        self.assertEqual(len(hits), 1)
+        self.assertIn("Carol", hits[0]["from"])
+
+    def test_search_filter_subject_narrows_results(self) -> None:
+        code, out, _ = self._run(
+            "mail-search",
+            "--path", "mail/sample.mbox",
+            "--query", "meeting",
+            "--filter-subject", "Re:",
+        )
+        self.assertEqual(code, EXIT_SUCCESS, msg=out)
+        payload = json.loads(out)
+        for h in payload["result"]["hits"]:
+            self.assertTrue(h["subject"].lower().startswith("re:"))
+
+    def test_search_filter_body_contains_narrows_results(self) -> None:
+        code, out, _ = self._run(
+            "mail-search",
+            "--path", "mail/sample.mbox",
+            "--query", "Q2",
+            "--filter-body-contains", "Q2 review",
+        )
+        self.assertEqual(code, EXIT_SUCCESS, msg=out)
+        payload = json.loads(out)
+        self.assertEqual(len(payload["result"]["hits"]), 1)
+
+    def test_search_filter_excludes_all_messages(self) -> None:
+        code, out, _ = self._run(
+            "mail-search",
+            "--path", "mail/sample.mbox",
+            "--query", "meeting",
+            "--filter-from", "nobody@example",
+        )
+        self.assertEqual(code, EXIT_DENIED)
+        payload = json.loads(out)
+        self.assertEqual(payload["stage"], "search")
+        self.assertEqual(payload["result"]["message_count"], 0)
+
+    # ---- mail-summarize filters ----
+
+    def test_summarize_filter_from_reduces_summarized_count(self) -> None:
+        code, out, _ = self._run(
+            "mail-summarize",
+            "--path", "mail/sample.mbox",
+            "--filter-from", "alice",
+        )
+        self.assertEqual(code, EXIT_SUCCESS, msg=out)
+        payload = json.loads(out)
+        self.assertEqual(payload["result"]["message_count"], 1)
+        self.assertEqual(payload["result"]["summarized_count"], 1)
+
+    def test_summarize_filter_subject_reduces_summarized_count(self) -> None:
+        code, out, _ = self._run(
+            "mail-summarize",
+            "--path", "mail/sample.mbox",
+            "--filter-subject", "Lunch",
+        )
+        self.assertEqual(code, EXIT_SUCCESS, msg=out)
+        payload = json.loads(out)
+        self.assertEqual(payload["result"]["message_count"], 1)
+
+    def test_summarize_filter_drops_all_returns_exit_two(self) -> None:
+        code, out, _ = self._run(
+            "mail-summarize",
+            "--path", "mail/sample.mbox",
+            "--filter-from", "nobody@example",
+        )
+        self.assertEqual(code, EXIT_DENIED)
+        payload = json.loads(out)
+        self.assertEqual(payload["stage"], "mail_read")
+        self.assertEqual(payload["reason"], "no messages")
+
+    def test_summarize_eml_filter_match_passes(self) -> None:
+        code, out, _ = self._run(
+            "mail-summarize",
+            "--path", "mail/sample.eml",
+            "--filter-from", "alice",
+        )
+        self.assertEqual(code, EXIT_SUCCESS, msg=out)
+        payload = json.loads(out)
+        self.assertEqual(payload["result"]["message_count"], 1)
+
+    def test_summarize_eml_filter_mismatch_returns_exit_two(self) -> None:
+        code, out, _ = self._run(
+            "mail-summarize",
+            "--path", "mail/sample.eml",
+            "--filter-from", "bob@example",
+        )
+        self.assertEqual(code, EXIT_DENIED)
+        payload = json.loads(out)
+        self.assertEqual(payload["stage"], "mail_read")
+        self.assertEqual(payload["reason"], "no messages")
+
+
 if __name__ == "__main__":
     unittest.main()
