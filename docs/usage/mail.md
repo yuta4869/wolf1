@@ -24,46 +24,81 @@ also block, not just critical markers.
 
 ## Filters
 
-Both `mail-search` and `mail-summarize` accept three pre-filter flags
-that narrow the candidate messages before the search / summary runs.
-All three are case-insensitive substring matches; combining them is
-AND.
+All three mail subcommands (`mail-summarize`, `mail-search`,
+`mail-draft`) accept the same three pre-filter flags:
 
-- `--filter-subject SUBSTR` — keeps only messages whose `Subject`
-  header contains SUBSTR.
-- `--filter-from SUBSTR` — keeps only messages whose `From` header
-  contains SUBSTR.
-- `--filter-body-contains SUBSTR` — keeps only messages whose body
-  contains SUBSTR.
+- `--filter-subject SUBSTR`
+- `--filter-from SUBSTR`
+- `--filter-body-contains SUBSTR`
 
-For `mail-search` these filters are orthogonal to `--query`: the
-filter runs first to drop messages, then the search runs against
-whatever survives. Use this to focus on a thread, sender, or topic
-before running a substring or content match.
+All three are case-insensitive substring matches.
 
-For `mail-summarize` the filters cut the set of messages that get
+**OR within a kind**: pass the same flag multiple times to OR-combine.
+For example `--filter-from alice --filter-from bob` keeps messages
+whose From header contains "alice" *or* "bob".
+
+**AND across kinds**: different filter flags are AND-combined.
+`--filter-from alice --filter-subject meeting` keeps messages from
+alice *and* whose subject contains "meeting".
+
+For `mail-search` filters are orthogonal to `--query`: the filter
+runs first to drop messages, then `--query` runs against whatever
+survives.
+
+For `mail-summarize` filters cut the set of messages that get
 summarized.
 
-If all messages are dropped by the filters, the CLI exits 2:
+For `mail-draft` filters narrow the candidate list **before**
+`--message-index` is applied. `--message-index 0` (default) selects
+the first filtered message.
+
+Exit-2 semantics when filters drop everything:
 - `mail-search` with empty candidate set → `stage=search`
   `result.message_count=0`.
 - `mail-summarize` with empty candidate set → `stage=mail_read`
   `reason="no messages"`.
+- `mail-draft` with empty candidate set → `stage=mail_read`
+  `reason="no messages"`.
+- `mail-draft` with non-empty candidate set but `--message-index`
+  out of range → `stage=mail_read` `reason="message_index out of range"`.
 
 ## File support
 
 - `.eml` — single message, parsed with Python's `email` package
   (default policy). Headers extracted: from / to / cc / subject /
   date / message-id. Text/plain part is preferred; text/html is
-  converted to plain text by a stdlib HTMLParser. Attachments are
-  recorded as a `has_attachments` flag but their bytes are never
-  read into the body.
+  converted to plain text by a stdlib HTMLParser.
 - `.mbox` — multiple messages, parsed with `mailbox.mbox`.
-  `--limit` caps how many are read (default 10). `--filter-subject`,
-  `--filter-from`, `--filter-body-contains` work at the read-local
-  layer if you call the module directly; the CLI exposes
-  `--query` on `mail-search` and the basic limit on
-  `mail-summarize` / `mail-draft`.
+  `--limit` caps how many are read (default 10).
+- Maildir directory — a directory containing `cur/`, `new/`, and
+  `tmp/` subdirectories. Parsed with `mailbox.Maildir`. The CLI
+  detects Maildir automatically when `--path` is a directory; if
+  the directory does not have the Maildir layout, the command
+  exits 2 with a `stage=mail_read` denial.
+
+All three formats flow through the same three subcommands
+(`mail-summarize`, `mail-search`, `mail-draft`) and accept the same
+filter / output flags.
+
+## Attachment metadata
+
+Attachment bytes are never read into the body. For each attachment,
+wolf records:
+
+- `filename` (empty string if absent)
+- `content_type`
+- `size_bytes` (size of the encoded payload as it appeared in the
+  mail; base64 is reported at the encoded size)
+
+`mail-summarize` JSON `result.summaries[]` carries `has_attachments`,
+`attachments_count`, and an `attachments` array.
+
+`mail-search` JSON `result.hits[]` carries `has_attachments` and
+`attachments_count` (no per-attachment array, to keep hit payloads
+small).
+
+`mail-draft` JSON `result` carries `source_has_attachments` and
+`source_attachments_count` for the message that produced the draft.
 
 ## Examples
 

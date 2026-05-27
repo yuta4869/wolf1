@@ -123,6 +123,95 @@ class ReadAnyTest(unittest.TestCase):
         r2 = read_mail_any(FIXTURES / "sample.mbox")
         self.assertEqual(len(r2.messages), 3)
 
+    def test_dispatches_to_maildir(self) -> None:
+        r = read_mail_any(FIXTURES / "sample_maildir")
+        self.assertEqual(len(r.messages), 3)
+        subjects = {m.subject for m in r.messages}
+        self.assertIn("Maildir meeting agenda", subjects)
+
+    def test_directory_without_cur_new_tmp_rejected(self) -> None:
+        # tests/fixtures/mail itself has files, not a Maildir layout.
+        from wolf.mail.read_local import MailReadError
+        with self.assertRaises(MailReadError):
+            read_mail_any(FIXTURES)
+
+
+class MaildirTest(unittest.TestCase):
+    def test_reads_all_messages(self) -> None:
+        r = read_mail_any(FIXTURES / "sample_maildir")
+        self.assertEqual(len(r.messages), 3)
+
+    def test_limit_caps_messages(self) -> None:
+        r = read_mail_any(FIXTURES / "sample_maildir", limit=1)
+        self.assertEqual(len(r.messages), 1)
+
+    def test_filter_from_narrows(self) -> None:
+        r = read_mail_any(
+            FIXTURES / "sample_maildir",
+            filter_from="alice",
+        )
+        self.assertEqual(len(r.messages), 1)
+        self.assertIn("Alice", r.messages[0].from_)
+
+    def test_filter_mismatch_returns_empty(self) -> None:
+        r = read_mail_any(
+            FIXTURES / "sample_maildir",
+            filter_from="nobody@example",
+        )
+        self.assertEqual(r.messages, ())
+
+
+class AttachmentsTest(unittest.TestCase):
+    def test_attachment_meta_eml_has_attachment_metadata(self) -> None:
+        pm = read_mail_any(FIXTURES / "attachment_meta.eml").messages[0]
+        self.assertTrue(pm.has_attachments)
+        self.assertEqual(len(pm.attachments), 1)
+        a = pm.attachments[0]
+        self.assertEqual(a.filename, "spec.bin")
+        self.assertEqual(a.content_type, "application/octet-stream")
+        self.assertGreater(a.size_bytes, 0)
+
+    def test_plain_eml_has_no_attachments(self) -> None:
+        pm = read_mail_any(FIXTURES / "sample.eml").messages[0]
+        self.assertFalse(pm.has_attachments)
+        self.assertEqual(pm.attachments, ())
+
+    def test_attachment_payload_bytes_not_in_body(self) -> None:
+        pm = read_mail_any(FIXTURES / "attachment_meta.eml").messages[0]
+        # The base64 PNG signature would start "iVBORw0KG" when decoded
+        # from the eml fixture; it must not appear in the body.
+        self.assertNotIn("iVBORw0KG", pm.body)
+
+
+class OrFilterTest(unittest.TestCase):
+    def test_filter_list_or_combines(self) -> None:
+        r = read_mail_any(
+            FIXTURES / "sample.mbox",
+            filter_from=["alice", "carol"],
+        )
+        # Alice + Carol = 2 messages (Bob excluded).
+        froms = [m.from_ for m in r.messages]
+        self.assertEqual(len(froms), 2)
+        self.assertTrue(any("Alice" in f for f in froms))
+        self.assertTrue(any("Carol" in f for f in froms))
+
+    def test_filter_list_with_empty_strings_is_no_filter(self) -> None:
+        r = read_mail_any(
+            FIXTURES / "sample.mbox",
+            filter_from=["", ""],
+        )
+        self.assertEqual(len(r.messages), 3)
+
+    def test_mixed_filter_kinds_are_anded(self) -> None:
+        # filter_from "alice" OR "carol", AND subject contains "Lunch".
+        r = read_mail_any(
+            FIXTURES / "sample.mbox",
+            filter_from=["alice", "carol"],
+            filter_subject="Lunch",
+        )
+        self.assertEqual(len(r.messages), 1)
+        self.assertIn("Lunch", r.messages[0].subject)
+
 
 if __name__ == "__main__":
     unittest.main()

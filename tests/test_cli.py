@@ -2604,5 +2604,197 @@ class MailCliFilterTest(unittest.TestCase):
         self.assertEqual(payload["reason"], "no messages")
 
 
+class MailInteropTest(unittest.TestCase):
+    """PR #24: Maildir + attachments metadata + OR filters + mail-draft filter."""
+
+    def setUp(self) -> None:
+        self.fixture = _ProjectFixture()
+        import shutil
+
+        src_fixtures = REPO_ROOT / "tests" / "fixtures" / "mail"
+        dst = self.fixture.root / "mail"
+        dst.mkdir()
+        for name in ("sample.eml", "sample.mbox", "attachment_meta.eml"):
+            shutil.copy(src_fixtures / name, dst / name)
+        shutil.copytree(
+            src_fixtures / "sample_maildir", dst / "sample_maildir"
+        )
+
+    def tearDown(self) -> None:
+        self.fixture.cleanup()
+
+    def _run(self, *extra_args: str):
+        return _run_inproc(
+            ["--project-root", str(self.fixture.root), *extra_args]
+        )
+
+    # ---- Maildir ----
+
+    def test_summarize_maildir(self) -> None:
+        code, out, _ = self._run("mail-summarize", "--path", "mail/sample_maildir")
+        self.assertEqual(code, EXIT_SUCCESS, msg=out)
+        payload = json.loads(out)
+        self.assertEqual(payload["result"]["message_count"], 3)
+        self.assertGreaterEqual(payload["result"]["summarized_count"], 1)
+
+    def test_search_maildir(self) -> None:
+        code, out, _ = self._run(
+            "mail-search", "--path", "mail/sample_maildir", "--query", "meeting"
+        )
+        self.assertEqual(code, EXIT_SUCCESS, msg=out)
+        payload = json.loads(out)
+        self.assertGreater(len(payload["result"]["hits"]), 0)
+
+    def test_draft_maildir(self) -> None:
+        code, out, _ = self._run(
+            "mail-draft",
+            "--path", "mail/sample_maildir",
+            "--filter-subject", "Maildir meeting",
+            "--instruction", "丁寧に返信",
+        )
+        self.assertEqual(code, EXIT_SUCCESS, msg=out)
+        payload = json.loads(out)
+        self.assertIn("Maildir", payload["result"]["source_subject"])
+
+    def test_maildir_filter_mismatch_exits_two(self) -> None:
+        code, out, _ = self._run(
+            "mail-summarize",
+            "--path", "mail/sample_maildir",
+            "--filter-from", "nobody@example",
+        )
+        self.assertEqual(code, EXIT_DENIED)
+        payload = json.loads(out)
+        self.assertEqual(payload["stage"], "mail_read")
+        self.assertEqual(payload["reason"], "no messages")
+
+    # ---- OR filter ----
+
+    def test_or_filter_from_combines(self) -> None:
+        code, out, _ = self._run(
+            "mail-search",
+            "--path", "mail/sample.mbox",
+            "--query", "meeting",
+            "--filter-from", "alice",
+            "--filter-from", "bob",
+        )
+        self.assertEqual(code, EXIT_SUCCESS, msg=out)
+        payload = json.loads(out)
+        froms = [h["from"] for h in payload["result"]["hits"]]
+        self.assertTrue(any("Alice" in f for f in froms))
+        self.assertTrue(any("Bob" in f for f in froms))
+        self.assertFalse(any("Carol" in f for f in froms))
+
+    def test_or_with_unrelated_kinds_is_anded(self) -> None:
+        code, out, _ = self._run(
+            "mail-search",
+            "--path", "mail/sample.mbox",
+            "--query", "Lunch",
+            "--filter-from", "alice",
+            "--filter-from", "bob",
+            "--filter-subject", "Lunch",
+        )
+        self.assertEqual(code, EXIT_DENIED)
+        payload = json.loads(out)
+        self.assertEqual(payload["stage"], "search")
+        self.assertEqual(payload["result"]["message_count"], 0)
+
+    # ---- attachments metadata ----
+
+    def test_summarize_attachment_meta_in_json(self) -> None:
+        code, out, _ = self._run(
+            "mail-summarize", "--path", "mail/attachment_meta.eml"
+        )
+        self.assertEqual(code, EXIT_SUCCESS, msg=out)
+        payload = json.loads(out)
+        s = payload["result"]["summaries"][0]
+        self.assertTrue(s["has_attachments"])
+        self.assertEqual(s["attachments_count"], 1)
+        self.assertEqual(s["attachments"][0]["filename"], "spec.bin")
+        self.assertEqual(
+            s["attachments"][0]["content_type"], "application/octet-stream"
+        )
+        self.assertGreater(s["attachments"][0]["size_bytes"], 0)
+
+    def test_search_hit_has_attachments_count(self) -> None:
+        code, out, _ = self._run(
+            "mail-search",
+            "--path", "mail/attachment_meta.eml",
+            "--query", "spec",
+        )
+        self.assertEqual(code, EXIT_SUCCESS, msg=out)
+        payload = json.loads(out)
+        h = payload["result"]["hits"][0]
+        self.assertTrue(h["has_attachments"])
+        self.assertEqual(h["attachments_count"], 1)
+
+    def test_draft_source_has_attachments_meta(self) -> None:
+        code, out, _ = self._run(
+            "mail-draft",
+            "--path", "mail/attachment_meta.eml",
+            "--instruction", "ok",
+        )
+        self.assertEqual(code, EXIT_SUCCESS, msg=out)
+        payload = json.loads(out)
+        self.assertTrue(payload["result"]["source_has_attachments"])
+        self.assertEqual(payload["result"]["source_attachments_count"], 1)
+
+    def test_attachment_payload_not_in_output(self) -> None:
+        code, out, err = self._run(
+            "mail-summarize", "--path", "mail/attachment_meta.eml"
+        )
+        self.assertEqual(code, EXIT_SUCCESS)
+        self.assertNotIn("iVBORw0KG", out)
+        self.assertNotIn("iVBORw0KG", err)
+
+    # ---- mail-draft filter selection ----
+
+    def test_draft_mbox_with_filter_picks_filtered_first(self) -> None:
+        code, out, _ = self._run(
+            "mail-draft",
+            "--path", "mail/sample.mbox",
+            "--filter-from", "carol",
+            "--instruction", "lunch にしましょう",
+        )
+        self.assertEqual(code, EXIT_SUCCESS, msg=out)
+        payload = json.loads(out)
+        self.assertEqual(payload["result"]["source_subject"], "Lunch on Friday?")
+
+    def test_draft_filter_mismatch_exits_two(self) -> None:
+        code, out, _ = self._run(
+            "mail-draft",
+            "--path", "mail/sample.mbox",
+            "--filter-from", "nobody@example",
+            "--instruction", "ok",
+        )
+        self.assertEqual(code, EXIT_DENIED)
+        payload = json.loads(out)
+        self.assertEqual(payload["stage"], "mail_read")
+        self.assertEqual(payload["reason"], "no messages")
+
+    def test_draft_filter_index_out_of_range(self) -> None:
+        code, out, _ = self._run(
+            "mail-draft",
+            "--path", "mail/sample.mbox",
+            "--filter-from", "carol",
+            "--message-index", "5",
+            "--instruction", "ok",
+        )
+        self.assertEqual(code, EXIT_DENIED)
+        payload = json.loads(out)
+        self.assertEqual(payload["stage"], "mail_read")
+        self.assertEqual(payload["reason"], "message_index out of range")
+
+    def test_draft_eml_filter_mismatch_exits_two(self) -> None:
+        code, out, _ = self._run(
+            "mail-draft",
+            "--path", "mail/sample.eml",
+            "--filter-from", "bob",
+            "--instruction", "ok",
+        )
+        self.assertEqual(code, EXIT_DENIED)
+        payload = json.loads(out)
+        self.assertEqual(payload["stage"], "mail_read")
+
+
 if __name__ == "__main__":
     unittest.main()

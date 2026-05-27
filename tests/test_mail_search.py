@@ -98,5 +98,25 @@ class MailSearchTest(unittest.TestCase):
         self.assertNotIn(marker, hits[0].snippet)
 
 
+class AttachmentInHitTest(unittest.TestCase):
+    def test_hit_carries_attachment_meta(self) -> None:
+        from wolf.mail.read_local import read_eml
+
+        pm = read_eml(FIXTURES / "attachment_meta.eml")
+        hits = search_mail((pm,), "spec")
+        self.assertEqual(len(hits), 1)
+        self.assertTrue(hits[0].has_attachments)
+        self.assertEqual(hits[0].attachments_count, 1)
+
+    def test_hit_without_attachment_reports_zero(self) -> None:
+        from wolf.mail.read_local import read_eml
+
+        pm = read_eml(FIXTURES / "sample.eml")
+        hits = search_mail((pm,), "meeting")
+        self.assertEqual(len(hits), 1)
+        self.assertFalse(hits[0].has_attachments)
+        self.assertEqual(hits[0].attachments_count, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
