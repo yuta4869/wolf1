@@ -156,6 +156,8 @@ directory), `--limit N` (default 10), `--max-bytes N` (default 1
 MiB), `--filter-subject SUBSTR`, `--filter-from SUBSTR`,
 `--filter-body-contains SUBSTR` (pre-filter messages; repeatable
 to OR-combine within a kind; different kinds AND-combine),
+`--filter-since YYYY-MM-DD`, `--filter-until YYYY-MM-DD` (UTC
+date window; inclusive end-of-day for until; see `mail.md`),
 `--backend {fake,ollama}`, `--model NAME`, `--ollama-url`,
 `--allow-non-localhost-ollama`, `--output {json,text}`. JSON output
 under `result.summaries[]` carries `has_attachments`,
@@ -175,7 +177,9 @@ directory), `--query TEXT` (required), `--limit N`, `--max-hits N`
 (default 10), `--max-bytes N`, `--filter-subject SUBSTR`,
 `--filter-from SUBSTR`, `--filter-body-contains SUBSTR` (repeatable
 to OR-combine within a kind; AND across kinds; orthogonal to
-`--query`), `--output {json,text}`. Each `result.hits[]` entry
+`--query`), `--filter-since YYYY-MM-DD`,
+`--filter-until YYYY-MM-DD` (UTC date window; see `mail.md`),
+`--output {json,text}`. Each `result.hits[]` entry
 carries `has_attachments` and `attachments_count`.
 
 ### `mail-draft`
@@ -192,9 +196,53 @@ directory), `--instruction TEXT` (required), `--message-index N`
 (default 0; applied to filtered list), `--limit N`, `--max-bytes N`,
 `--filter-subject SUBSTR`, `--filter-from SUBSTR`,
 `--filter-body-contains SUBSTR` (repeatable; same semantics as
-mail-search), `--backend`, `--model`, `--ollama-url`,
+mail-search), `--filter-since YYYY-MM-DD`,
+`--filter-until YYYY-MM-DD` (UTC date window; see `mail.md`),
+`--backend`, `--model`, `--ollama-url`,
 `--allow-non-localhost-ollama`, `--output {json,text}`. JSON `result`
 carries `source_has_attachments` and `source_attachments_count`.
+
+### `mail-thread`
+
+Group the messages in a local mailbox into conversation threads
+using `Message-ID` / `In-Reply-To` / `References` headers plus a
+normalized-subject fallback. No LLM call; pure stdlib clustering.
+
+```sh
+python -m wolf.cli mail-thread --path PATH [options]
+```
+
+Key flags: `--path PATH` (required, `.eml`, `.mbox`, or Maildir
+directory), `--limit N` (default 100), `--max-bytes N`,
+`--filter-subject SUBSTR`, `--filter-from SUBSTR`,
+`--filter-body-contains SUBSTR` (filter messages before threading;
+repeatable as in mail-search), `--filter-since YYYY-MM-DD`,
+`--filter-until YYYY-MM-DD` (UTC date window; see [mail.md](mail.md)),
+`--output {json,text}`. JSON `result.threads[]` carries
+`thread_id`, `subject`, `message_count`, `participants`,
+`first_date`, `last_date`, and a body-less `messages[]` array
+(see `docs/usage/mail.md`).
+
+### `mail-search-summarize`
+
+Combine `mail-search` and `mail-summarize` in one Router-mediated
+call. Default mode summarizes each hit individually, then produces
+an aggregate; `--threaded` groups the hits into conversations via
+`mail-thread` first and summarizes per-thread.
+
+```sh
+python -m wolf.cli mail-search-summarize \
+    --path PATH --query TEXT [options]
+```
+
+Key flags: as `mail-search`, plus `--threaded`,
+`--per-message-summary/--no-per-message-summary` (default on),
+`--filter-since YYYY-MM-DD`, `--filter-until YYYY-MM-DD`, and the
+usual `--backend` / `--model` / `--ollama-url` /
+`--allow-non-localhost-ollama` / `--output` flags. The aggregate
+step runs under a Router configured with
+`allow_warning_injection_findings=True` because its input is
+LLM-generated text; critical injection markers still block.
 
 ### `summarize-email`
 

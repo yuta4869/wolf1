@@ -2604,6 +2604,270 @@ class MailCliFilterTest(unittest.TestCase):
         self.assertEqual(payload["reason"], "no messages")
 
 
+class MailWorkflowTest(unittest.TestCase):
+    """PR #25: mail-thread + mail-search-summarize + datetime filter."""
+
+    def setUp(self) -> None:
+        self.fixture = _ProjectFixture()
+        import shutil
+
+        src_fixtures = REPO_ROOT / "tests" / "fixtures" / "mail"
+        dst = self.fixture.root / "mail"
+        dst.mkdir()
+        for name in (
+            "sample.eml",
+            "sample.mbox",
+            "thread.mbox",
+            "injection_sample.eml",
+        ):
+            shutil.copy(src_fixtures / name, dst / name)
+        shutil.copytree(
+            src_fixtures / "sample_maildir", dst / "sample_maildir"
+        )
+
+    def tearDown(self) -> None:
+        self.fixture.cleanup()
+
+    def _run(self, *extra_args: str):
+        return _run_inproc(
+            ["--project-root", str(self.fixture.root), *extra_args]
+        )
+
+    # ---- mail-thread ----
+
+    def test_thread_groups_via_message_ids(self) -> None:
+        code, out, _ = self._run("mail-thread", "--path", "mail/thread.mbox")
+        self.assertEqual(code, EXIT_SUCCESS, msg=out)
+        payload = json.loads(out)
+        self.assertEqual(payload["result"]["thread_count"], 3)
+        q3 = next(
+            t for t in payload["result"]["threads"]
+            if "Q3 planning" in t["subject"]
+        )
+        self.assertEqual(q3["message_count"], 3)
+
+    def test_thread_text_output(self) -> None:
+        code, out, _ = self._run(
+            "mail-thread", "--path", "mail/thread.mbox", "--output", "text"
+        )
+        self.assertEqual(code, EXIT_SUCCESS)
+        with self.assertRaises(json.JSONDecodeError):
+            json.loads(out)
+        self.assertIn("Q3 planning", out)
+
+    def test_thread_maildir(self) -> None:
+        code, out, _ = self._run(
+            "mail-thread", "--path", "mail/sample_maildir"
+        )
+        self.assertEqual(code, EXIT_SUCCESS, msg=out)
+        payload = json.loads(out)
+        self.assertGreater(payload["result"]["thread_count"], 0)
+
+    def test_thread_does_not_include_raw_body(self) -> None:
+        code, out, _ = self._run("mail-thread", "--path", "mail/thread.mbox")
+        self.assertEqual(code, EXIT_SUCCESS)
+        self.assertNotIn("Booked. I'll bring the Q2 metrics", out)
+        self.assertNotIn("Kicking off Q3 planning", out)
+
+    def test_thread_filter_drops_unrelated(self) -> None:
+        code, out, _ = self._run(
+            "mail-thread",
+            "--path", "mail/thread.mbox",
+            "--filter-subject", "Q3 planning",
+        )
+        self.assertEqual(code, EXIT_SUCCESS, msg=out)
+        payload = json.loads(out)
+        self.assertEqual(payload["result"]["thread_count"], 1)
+
+    # ---- mail-search-summarize ----
+
+    def test_search_summarize_basic(self) -> None:
+        code, out, _ = self._run(
+            "mail-search-summarize",
+            "--path", "mail/thread.mbox",
+            "--query", "Q3",
+        )
+        self.assertEqual(code, EXIT_SUCCESS, msg=out)
+        payload = json.loads(out)
+        self.assertEqual(payload["result"]["mode"], "message")
+        self.assertGreater(payload["result"]["summarized_count"], 0)
+        self.assertIn("summary", payload["result"])
+
+    def test_search_summarize_threaded(self) -> None:
+        code, out, _ = self._run(
+            "mail-search-summarize",
+            "--path", "mail/thread.mbox",
+            "--query", "Q3",
+            "--threaded",
+        )
+        self.assertEqual(code, EXIT_SUCCESS, msg=out)
+        payload = json.loads(out)
+        self.assertEqual(payload["result"]["mode"], "threaded")
+        self.assertEqual(len(payload["result"]["threads"]), 1)
+        self.assertEqual(payload["result"]["threads"][0]["message_count"], 3)
+
+    def test_search_summarize_no_hits_exit_two(self) -> None:
+        code, out, _ = self._run(
+            "mail-search-summarize",
+            "--path", "mail/thread.mbox",
+            "--query", "no_such_token_42_xyz",
+        )
+        self.assertEqual(code, EXIT_DENIED)
+        payload = json.loads(out)
+        self.assertEqual(payload["stage"], "search")
+
+    def test_search_summarize_per_message_summary_flag(self) -> None:
+        code, out, _ = self._run(
+            "mail-search-summarize",
+            "--path", "mail/thread.mbox",
+            "--query", "Q3",
+            "--include-per-message-summary",
+        )
+        self.assertEqual(code, EXIT_SUCCESS, msg=out)
+        payload = json.loads(out)
+        for m in payload["result"]["messages"]:
+            self.assertIn("summary", m)
+            self.assertIsInstance(m["summary"], str)
+
+    def test_search_summarize_text_output(self) -> None:
+        code, out, _ = self._run(
+            "mail-search-summarize",
+            "--path", "mail/thread.mbox",
+            "--query", "Q3",
+            "--output", "text",
+        )
+        self.assertEqual(code, EXIT_SUCCESS)
+        with self.assertRaises(json.JSONDecodeError):
+            json.loads(out)
+        self.assertIn("SUMMARY", out)
+
+    def test_search_summarize_injection_only_returns_no_hits(self) -> None:
+        # injection_sample.eml: only message; query targets its body
+        # but the body contains a critical marker, so per-message scan
+        # blocks. Result: 0 messages were summarized → exit 2 search.
+        code, out, _ = self._run(
+            "mail-search-summarize",
+            "--path", "mail/injection_sample.eml",
+            "--query", "ignore previous",
+        )
+        self.assertEqual(code, EXIT_DENIED)
+
+    def test_search_summarize_maildir(self) -> None:
+        code, out, _ = self._run(
+            "mail-search-summarize",
+            "--path", "mail/sample_maildir",
+            "--query", "meeting",
+        )
+        self.assertEqual(code, EXIT_SUCCESS, msg=out)
+        payload = json.loads(out)
+        self.assertGreater(payload["result"]["summarized_count"], 0)
+
+    def test_search_summarize_does_not_leak_body_to_stderr(self) -> None:
+        marker = "MAIL_SEARCH_SUMMARIZE_LEAK_PROBE_QQ"
+        leaky = self.fixture.root / "mail" / "leaky.mbox"
+        leaky.write_text(
+            "From x@y Mon Jan 1 09:00:00 2026\n"
+            "From: x@y\nTo: a@b\nSubject: leaky test\n"
+            "Date: Mon, 1 Jan 2026 09:00:00 +0000\n"
+            "Message-ID: <leaky-001@x>\n"
+            "MIME-Version: 1.0\n"
+            "Content-Type: text/plain; charset=utf-8\n\n"
+            f"{marker}\n" + ("filler line. " * 200) + "\nfind keyword here\n\n",
+            encoding="utf-8",
+        )
+        code, _, err = self._run(
+            "mail-search-summarize",
+            "--path", "mail/leaky.mbox",
+            "--query", "find keyword",
+            "--output", "text",
+        )
+        self.assertEqual(code, EXIT_SUCCESS)
+        self.assertNotIn(marker, err)
+
+    def test_search_summarize_ollama_mocked(self) -> None:
+        import urllib.request
+        from unittest import mock
+
+        def fake_urlopen(req, timeout=None):
+            class _Resp:
+                def __enter__(self_inner):
+                    return self_inner
+
+                def __exit__(self_inner, *a):
+                    return False
+
+                def read(self_inner):
+                    return json.dumps(
+                        {"response": "mss-summary", "done": True}
+                    ).encode("utf-8")
+
+            return _Resp()
+
+        with mock.patch.object(
+            urllib.request, "urlopen", side_effect=fake_urlopen
+        ):
+            code, out, _ = self._run(
+                "mail-search-summarize",
+                "--path", "mail/thread.mbox",
+                "--query", "Q3",
+                "--backend", "ollama",
+                "--model", "llama3.1",
+            )
+        self.assertEqual(code, EXIT_SUCCESS, msg=out)
+        payload = json.loads(out)
+        self.assertEqual(payload["result"]["summary"], "mss-summary")
+
+    # ---- datetime filters ----
+
+    def test_filter_since_drops_earlier_messages(self) -> None:
+        # thread.mbox messages 0-2 dated 2026-05-21 JST = 2026-05-21
+        # UTC; messages 3-4 dated 2026-05-22 JST. The 08:00 JST = 23:00
+        # UTC on 2026-05-21; the 09:00 JST = 00:00 UTC on 2026-05-22.
+        # --filter-since 2026-05-22 keeps only msg 4 (Eve 09:00 JST).
+        code, out, _ = self._run(
+            "mail-summarize",
+            "--path", "mail/thread.mbox",
+            "--filter-since", "2026-05-22",
+        )
+        self.assertEqual(code, EXIT_SUCCESS, msg=out)
+        payload = json.loads(out)
+        self.assertEqual(payload["result"]["message_count"], 1)
+
+    def test_filter_until_drops_later_messages(self) -> None:
+        code, out, _ = self._run(
+            "mail-summarize",
+            "--path", "mail/thread.mbox",
+            "--filter-until", "2026-05-21",
+        )
+        self.assertEqual(code, EXIT_SUCCESS, msg=out)
+        payload = json.loads(out)
+        # 2026-05-21 inclusive end-of-day UTC keeps all msgs except
+        # Eve's 2026-05-22 09:00 JST = 00:00 UTC msg, so 4 of 5.
+        self.assertEqual(payload["result"]["message_count"], 4)
+
+    def test_invalid_date_exits_two(self) -> None:
+        code, _, err = self._run(
+            "mail-summarize",
+            "--path", "mail/thread.mbox",
+            "--filter-since", "not-a-date",
+        )
+        self.assertEqual(code, EXIT_DENIED)
+        self.assertIn("invalid date", err.lower())
+
+    def test_filter_since_in_mail_search(self) -> None:
+        # All Q3 messages are 2026-05-21 UTC; filter-since 2026-05-22
+        # drops them. No hits → exit 2 stage=search.
+        code, out, _ = self._run(
+            "mail-search",
+            "--path", "mail/thread.mbox",
+            "--query", "Q3",
+            "--filter-since", "2026-05-22",
+        )
+        self.assertEqual(code, EXIT_DENIED)
+        payload = json.loads(out)
+        self.assertEqual(payload["stage"], "search")
+
+
 class MailInteropTest(unittest.TestCase):
     """PR #24: Maildir + attachments metadata + OR filters + mail-draft filter."""
 

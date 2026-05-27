@@ -40,8 +40,10 @@ from .mail.draft import build_draft_prompt, default_subject_for_reply
 from .mail.read_local import (
     DEFAULT_MAX_BODY_BYTES as MAIL_DEFAULT_MAX_BODY,
     DEFAULT_MBOX_LIMIT as MAIL_DEFAULT_MBOX_LIMIT,
+    DateFilter,
     MailReadError,
     ParsedMail,
+    _parse_filter_date,
     read_mail_any,
     read_mbox,
 )
@@ -50,6 +52,7 @@ from .mail.search import (
     MailHit,
     search_mail,
 )
+from .mail.thread import Thread, ThreadMessage, build_threads
 from .files.semantic_search import (
     DEFAULT_MAX_HITS as SEMANTIC_DEFAULT_MAX_HITS,
     SemanticHit,
@@ -1767,6 +1770,42 @@ def _emit_text_warning_count(warnings_count: int) -> None:
         )
 
 
+def _build_date_filter_from_args(
+    args: argparse.Namespace,
+) -> Optional[DateFilter]:
+    """Build a DateFilter from --filter-since / --filter-until args.
+
+    Returns None when both are absent so callers can pass an empty
+    filter through unchanged. Raises ValueError on a malformed CLI
+    date.
+    """
+    since_str = getattr(args, "filter_since", None)
+    until_str = getattr(args, "filter_until", None)
+    if not since_str and not until_str:
+        return None
+    since = _parse_filter_date(since_str) if since_str else None
+    until = _parse_filter_date(until_str) if until_str else None
+    return DateFilter(since=since, until=until)
+
+
+def _read_mail_with_args(
+    *,
+    args: argparse.Namespace,
+    path: Path,
+) -> "MboxReadResult":
+    """Centralized read_mail_any call site that pulls every filter the
+    mail subcommands accept off the argparse Namespace."""
+    return read_mail_any(
+        path,
+        limit=int(getattr(args, "limit", MAIL_DEFAULT_MBOX_LIMIT)),
+        max_bytes=int(getattr(args, "max_bytes", MAIL_DEFAULT_MAX_BODY)),
+        filter_subject=getattr(args, "filter_subject", None) or None,
+        filter_from=getattr(args, "filter_from", None) or None,
+        filter_body_contains=getattr(args, "filter_body_contains", None) or None,
+        date_filter=_build_date_filter_from_args(args),
+    )
+
+
 def cmd_mail_summarize(args: argparse.Namespace) -> int:
     project_root = Path(args.project_root).resolve()
     output_mode = getattr(args, "output", "json")
@@ -1796,16 +1835,10 @@ def cmd_mail_summarize(args: argparse.Namespace) -> int:
     if not path.is_absolute():
         path = (project_root / path).resolve()
     try:
-        result = read_mail_any(
-            path,
-            limit=int(getattr(args, "limit", MAIL_DEFAULT_MBOX_LIMIT)),
-            max_bytes=int(
-                getattr(args, "max_bytes", MAIL_DEFAULT_MAX_BODY)
-            ),
-            filter_subject=getattr(args, "filter_subject", None) or None,
-            filter_from=getattr(args, "filter_from", None) or None,
-            filter_body_contains=getattr(args, "filter_body_contains", None) or None,
-        )
+        result = _read_mail_with_args(args=args, path=path)
+    except ValueError as exc:
+        sys.stderr.write(f"wolf cli: {exc}\n")
+        return EXIT_DENIED
     except MailReadError as exc:
         payload = {
             "allowed": False,
@@ -1972,16 +2005,10 @@ def cmd_mail_search(args: argparse.Namespace) -> int:
     if not path.is_absolute():
         path = (project_root / path).resolve()
     try:
-        result = read_mail_any(
-            path,
-            limit=int(getattr(args, "limit", MAIL_DEFAULT_MBOX_LIMIT)),
-            max_bytes=int(
-                getattr(args, "max_bytes", MAIL_DEFAULT_MAX_BODY)
-            ),
-            filter_subject=getattr(args, "filter_subject", None) or None,
-            filter_from=getattr(args, "filter_from", None) or None,
-            filter_body_contains=getattr(args, "filter_body_contains", None) or None,
-        )
+        result = _read_mail_with_args(args=args, path=path)
+    except ValueError as exc:
+        sys.stderr.write(f"wolf cli: {exc}\n")
+        return EXIT_DENIED
     except MailReadError as exc:
         if output_mode == "text":
             sys.stderr.write(f"wolf cli: mail_read failed: {exc.label}\n")
@@ -2102,16 +2129,10 @@ def cmd_mail_draft(args: argparse.Namespace) -> int:
     if not path.is_absolute():
         path = (project_root / path).resolve()
     try:
-        result = read_mail_any(
-            path,
-            limit=int(getattr(args, "limit", MAIL_DEFAULT_MBOX_LIMIT)),
-            max_bytes=int(
-                getattr(args, "max_bytes", MAIL_DEFAULT_MAX_BODY)
-            ),
-            filter_subject=getattr(args, "filter_subject", None) or None,
-            filter_from=getattr(args, "filter_from", None) or None,
-            filter_body_contains=getattr(args, "filter_body_contains", None) or None,
-        )
+        result = _read_mail_with_args(args=args, path=path)
+    except ValueError as exc:
+        sys.stderr.write(f"wolf cli: {exc}\n")
+        return EXIT_DENIED
     except MailReadError as exc:
         if output_mode == "text":
             sys.stderr.write(f"wolf cli: mail_read failed: {exc.label}\n")
@@ -2237,6 +2258,513 @@ def cmd_mail_draft(args: argparse.Namespace) -> int:
         }
     )
     return EXIT_SUCCESS
+
+
+def _thread_to_dict(t: Thread) -> dict:
+    return {
+        "thread_id": t.thread_id,
+        "subject": t.subject,
+        "message_count": t.message_count,
+        "participants": list(t.participants),
+        "first_date": t.first_date,
+        "last_date": t.last_date,
+        "messages": [
+            {
+                "index": m.index,
+                "subject": m.subject,
+                "from": m.from_,
+                "date": m.date,
+                "message_id": m.message_id,
+            }
+            for m in t.messages
+        ],
+    }
+
+
+def cmd_mail_thread(args: argparse.Namespace) -> int:
+    project_root = Path(args.project_root).resolve()
+    output_mode = getattr(args, "output", "json")
+
+    try:
+        llm = _build_llm_from_args(args)
+    except ValueError as exc:
+        sys.stderr.write(f"wolf cli: {exc}\n")
+        return EXIT_DENIED
+    router = _build_router(project_root, llm=llm)
+
+    gate = _gate_mail_path(
+        router=router, path_str=args.path, output_mode=output_mode
+    )
+    if gate is not None:
+        return _emit_decision(
+            gate, output_mode=output_mode, include_result=False
+        )
+
+    path = Path(args.path)
+    if not path.is_absolute():
+        path = (project_root / path).resolve()
+    try:
+        result = _read_mail_with_args(args=args, path=path)
+    except ValueError as exc:
+        sys.stderr.write(f"wolf cli: {exc}\n")
+        return EXIT_DENIED
+    except MailReadError as exc:
+        if output_mode == "text":
+            sys.stderr.write(f"wolf cli: mail_read failed: {exc.label}\n")
+        else:
+            _print_json(
+                {
+                    "allowed": False,
+                    "executed": False,
+                    "requires_confirmation": False,
+                    "stage": "mail_read",
+                    "reason": f"mail_read failed: {exc.label}",
+                    "provider_called": False,
+                    "audit_event_id": None,
+                    "failed_checks": [f"mail_read: {exc.label}"],
+                    "warnings": [],
+                }
+            )
+        return EXIT_DENIED
+
+    threads = build_threads(result.messages)
+    if not threads:
+        if output_mode == "text":
+            sys.stderr.write("wolf cli: no threads to report\n")
+        else:
+            _print_json(
+                {
+                    "allowed": True,
+                    "executed": True,
+                    "requires_confirmation": False,
+                    "stage": "complete",
+                    "reason": "no threads",
+                    "provider_called": False,
+                    "audit_event_id": None,
+                    "failed_checks": [],
+                    "warnings": list(result.skipped),
+                    "result": {"thread_count": 0, "threads": []},
+                }
+            )
+        return EXIT_DENIED
+
+    if output_mode == "text":
+        for t in threads:
+            sys.stderr.write("")  # noop placeholder
+            sys.stdout.write(
+                f"[{t.message_count}] {t.subject} "
+                f"({t.first_date} → {t.last_date}; "
+                f"{len(t.participants)} participant(s))\n"
+            )
+        _emit_text_warning_count(len(result.skipped))
+        return EXIT_SUCCESS
+
+    _print_json(
+        {
+            "allowed": True,
+            "executed": True,
+            "requires_confirmation": False,
+            "stage": "complete",
+            "reason": f"{len(threads)} thread(s)",
+            "provider_called": False,
+            "audit_event_id": None,
+            "failed_checks": [],
+            "warnings": list(result.skipped),
+            "result": {
+                "thread_count": len(threads),
+                "threads": [_thread_to_dict(t) for t in threads],
+            },
+        }
+    )
+    return EXIT_SUCCESS
+
+
+def cmd_mail_search_summarize(args: argparse.Namespace) -> int:
+    project_root = Path(args.project_root).resolve()
+    output_mode = getattr(args, "output", "json")
+    query = getattr(args, "query", None)
+    if not query:
+        sys.stderr.write("wolf cli: --query is required\n")
+        return EXIT_DENIED
+
+    try:
+        llm = _build_llm_from_args(args)
+    except ValueError as exc:
+        sys.stderr.write(f"wolf cli: {exc}\n")
+        return EXIT_DENIED
+    # Mail is strict by default (warning markers block).
+    router = _build_router(
+        project_root,
+        llm=llm,
+        config=RouterConfig(allow_warning_injection_findings=False),
+    )
+
+    gate = _gate_mail_path(
+        router=router, path_str=args.path, output_mode=output_mode
+    )
+    if gate is not None:
+        return _emit_decision(
+            gate, output_mode=output_mode, include_result=False
+        )
+
+    path = Path(args.path)
+    if not path.is_absolute():
+        path = (project_root / path).resolve()
+    try:
+        result = _read_mail_with_args(args=args, path=path)
+    except ValueError as exc:
+        sys.stderr.write(f"wolf cli: {exc}\n")
+        return EXIT_DENIED
+    except MailReadError as exc:
+        if output_mode == "text":
+            sys.stderr.write(f"wolf cli: mail_read failed: {exc.label}\n")
+        else:
+            _print_json(
+                {
+                    "allowed": False,
+                    "executed": False,
+                    "requires_confirmation": False,
+                    "stage": "mail_read",
+                    "reason": f"mail_read failed: {exc.label}",
+                    "provider_called": False,
+                    "audit_event_id": None,
+                    "failed_checks": [f"mail_read: {exc.label}"],
+                    "warnings": [],
+                }
+            )
+        return EXIT_DENIED
+
+    max_hits = int(getattr(args, "max_hits", MAIL_SEARCH_DEFAULT_MAX_HITS))
+    hits = search_mail(result.messages, query, max_hits=max_hits)
+    if not hits:
+        payload = {
+            "allowed": False,
+            "executed": False,
+            "requires_confirmation": False,
+            "stage": "search",
+            "reason": "no hits",
+            "provider_called": False,
+            "audit_event_id": None,
+            "failed_checks": [],
+            "warnings": list(result.skipped),
+            "result": {
+                "query": query,
+                "hit_count": 0,
+                "message_count": len(result.messages),
+            },
+        }
+        if output_mode == "text":
+            sys.stderr.write(f"wolf cli: no mail hits for {query!r}\n")
+        else:
+            _print_json(payload)
+        return EXIT_DENIED
+
+    # Build a set of hit message_ids so we can pick the matching
+    # ParsedMail objects (the search returns MailHit metadata only;
+    # we need full bodies to summarize).
+    threaded = bool(getattr(args, "threaded", False))
+    include_per_message = bool(
+        getattr(args, "include_per_message_summary", False)
+    )
+
+    if threaded:
+        threads = build_threads(result.messages)
+        # Pick threads that contain at least one hit.
+        hit_msg_ids = {h.message_id for h in hits if h.message_id}
+        hit_subjects = {h.subject.lower() for h in hits if h.subject}
+        relevant_threads: List[Thread] = []
+        for t in threads:
+            in_thread = any(
+                (m.message_id and m.message_id in hit_msg_ids)
+                or (m.subject and m.subject.lower() in hit_subjects)
+                for m in t.messages
+            )
+            if in_thread:
+                relevant_threads.append(t)
+        if not relevant_threads:
+            if output_mode == "text":
+                sys.stderr.write("wolf cli: no threads matched the hits\n")
+            else:
+                _print_json(
+                    {
+                        "allowed": False,
+                        "executed": False,
+                        "requires_confirmation": False,
+                        "stage": "search",
+                        "reason": "no threads matched",
+                        "provider_called": False,
+                        "audit_event_id": None,
+                        "failed_checks": [],
+                        "warnings": list(result.skipped),
+                        "result": {
+                            "query": query,
+                            "hit_count": len(hits),
+                            "summarized_count": 0,
+                        },
+                    }
+                )
+            return EXIT_DENIED
+
+        # Summarize each thread by concatenating its messages' bodies.
+        thread_records: List[dict] = []
+        per_thread_summaries: List[str] = []
+        warnings: List[str] = list(result.skipped)
+        accepted = 0
+        for t in relevant_threads:
+            joined = "\n\n---\n\n".join(
+                f"From: {tm.from_}\nSubject: {tm.subject}\nDate: {tm.date}\n\n"
+                f"{result.messages[tm.index].body}"
+                for tm in t.messages
+            )
+            body = wrap_untrusted(
+                joined,
+                SourceKind.EMAIL,
+                source_ref=t.thread_id,
+                metadata={
+                    "subject": t.subject,
+                    "message_count": str(t.message_count),
+                },
+            )
+            decision = router.route(
+                RouterAction(
+                    kind=ActionKind.LLM_SUMMARIZE_EMAIL,
+                    risk_level=RiskLevel.LOW,
+                    body=body,
+                )
+            )
+            if not decision.allowed or not isinstance(decision.result, str):
+                warnings.append(
+                    f"mail-search-summarize: skipped thread "
+                    f"{t.thread_id!r} (stage={decision.stage})"
+                )
+                continue
+            per_thread_summaries.append(decision.result)
+            warnings.extend(decision.warnings)
+            record = {
+                "thread_id": t.thread_id,
+                "subject": t.subject,
+                "message_count": t.message_count,
+                "participants": list(t.participants),
+                "summary_length": len(decision.result),
+            }
+            if include_per_message:
+                record["summary"] = decision.result
+            thread_records.append(record)
+            accepted += 1
+
+        if accepted == 0:
+            payload = {
+                "allowed": False,
+                "executed": False,
+                "requires_confirmation": False,
+                "stage": "search",
+                "reason": "no threads could be summarized",
+                "provider_called": True,
+                "audit_event_id": None,
+                "failed_checks": [
+                    "mail-search-summarize: no eligible threads"
+                ],
+                "warnings": warnings,
+                "result": {
+                    "query": query,
+                    "hit_count": len(hits),
+                    "summarized_count": 0,
+                    "skipped_count": len(relevant_threads),
+                    "threads": [],
+                },
+            }
+            if output_mode == "text":
+                sys.stderr.write(
+                    f"wolf cli: {len(relevant_threads)} thread(s) but none "
+                    "could be summarized\n"
+                )
+            else:
+                _print_json(payload)
+            return EXIT_DENIED
+
+        aggregated_text = "\n\n".join(per_thread_summaries)
+        agg_body = wrap_untrusted(
+            aggregated_text,
+            SourceKind.EMAIL,
+            source_ref=f"search:thread:{query}",
+            metadata={
+                "thread_count": str(len(relevant_threads)),
+                "summarized_count": str(accepted),
+            },
+        )
+        # Aggregate input is our own LLM output; critical markers still
+        # block, but warning-level markers (e.g., "command", "tool call"
+        # in the model's own preamble) should not derail the final
+        # summary.
+        agg_router = _build_router(
+            project_root,
+            llm=llm,
+            config=RouterConfig(allow_warning_injection_findings=True),
+        )
+        final = agg_router.route(
+            RouterAction(
+                kind=ActionKind.LLM_SUMMARIZE_EMAIL,
+                risk_level=RiskLevel.LOW,
+                body=agg_body,
+            )
+        )
+        if warnings:
+            final = _decision_with_extra_warnings(final, warnings)
+
+        if output_mode == "text":
+            if final.allowed and isinstance(final.result, str):
+                sys.stdout.write(final.result)
+                if not final.result.endswith("\n"):
+                    sys.stdout.write("\n")
+                _emit_text_warning_count(len(final.warnings))
+                return EXIT_SUCCESS
+            sys.stderr.write(
+                f"wolf cli: stage={final.stage} reason={final.reason}\n"
+            )
+            return _exit_code_for(final)
+
+        payload = _decision_to_safe_dict(final, include_result=False)
+        payload["result"] = {
+            "query": query,
+            "mode": "threaded",
+            "hit_count": len(hits),
+            "summarized_count": accepted,
+            "skipped_count": len(relevant_threads) - accepted,
+            "threads": thread_records,
+        }
+        if final.allowed and isinstance(final.result, str):
+            payload["result"]["summary"] = final.result
+        _print_json(payload)
+        return _exit_code_for(final)
+
+    # Default (non-threaded) path: per-message summary, then aggregate.
+    hit_msg_ids = {h.message_id: h for h in hits if h.message_id}
+    msg_records: List[dict] = []
+    per_msg_summaries: List[str] = []
+    warnings = list(result.skipped)
+    accepted = 0
+    for pm in result.messages:
+        if pm.message_id not in hit_msg_ids:
+            # Skip non-hit messages.
+            continue
+        hit = hit_msg_ids[pm.message_id]
+        body = wrap_untrusted(
+            pm.body,
+            SourceKind.EMAIL,
+            source_ref=pm.message_id or "",
+            metadata={
+                "subject": pm.subject,
+                "from": pm.from_,
+            },
+        )
+        decision = router.route(
+            RouterAction(
+                kind=ActionKind.LLM_SUMMARIZE_EMAIL,
+                risk_level=RiskLevel.LOW,
+                body=body,
+            )
+        )
+        if not decision.allowed or not isinstance(decision.result, str):
+            warnings.append(
+                f"mail-search-summarize: skipped "
+                f"{pm.message_id or pm.subject!r} (stage={decision.stage})"
+            )
+            continue
+        per_msg_summaries.append(decision.result)
+        warnings.extend(decision.warnings)
+        record = {
+            "message_id": pm.message_id,
+            "subject": pm.subject,
+            "from": pm.from_,
+            "date": pm.date,
+            "match_field": hit.match_field,
+            "match_count": hit.match_count,
+            "summary_length": len(decision.result),
+        }
+        if include_per_message:
+            record["summary"] = decision.result
+        msg_records.append(record)
+        accepted += 1
+
+    if accepted == 0:
+        payload = {
+            "allowed": False,
+            "executed": False,
+            "requires_confirmation": False,
+            "stage": "search",
+            "reason": "no messages could be summarized",
+            "provider_called": True,
+            "audit_event_id": None,
+            "failed_checks": ["mail-search-summarize: no eligible messages"],
+            "warnings": warnings,
+            "result": {
+                "query": query,
+                "hit_count": len(hits),
+                "summarized_count": 0,
+                "skipped_count": len(hits),
+                "messages": [],
+            },
+        }
+        if output_mode == "text":
+            sys.stderr.write(
+                f"wolf cli: {len(hits)} hit(s) but none could be summarized\n"
+            )
+        else:
+            _print_json(payload)
+        return EXIT_DENIED
+
+    aggregated_text = "\n\n".join(per_msg_summaries)
+    agg_body = wrap_untrusted(
+        aggregated_text,
+        SourceKind.EMAIL,
+        source_ref=f"search:mail:{query}",
+        metadata={
+            "hit_count": str(len(hits)),
+            "summarized_count": str(accepted),
+        },
+    )
+    # Aggregate over LLM-generated per-message summaries: warning-level
+    # markers from the model's own preamble must not block.
+    agg_router = _build_router(
+        project_root,
+        llm=llm,
+        config=RouterConfig(allow_warning_injection_findings=True),
+    )
+    final = agg_router.route(
+        RouterAction(
+            kind=ActionKind.LLM_SUMMARIZE_EMAIL,
+            risk_level=RiskLevel.LOW,
+            body=agg_body,
+        )
+    )
+    if warnings:
+        final = _decision_with_extra_warnings(final, warnings)
+
+    if output_mode == "text":
+        if final.allowed and isinstance(final.result, str):
+            sys.stdout.write(final.result)
+            if not final.result.endswith("\n"):
+                sys.stdout.write("\n")
+            _emit_text_warning_count(len(final.warnings))
+            return EXIT_SUCCESS
+        sys.stderr.write(
+            f"wolf cli: stage={final.stage} reason={final.reason}\n"
+        )
+        return _exit_code_for(final)
+
+    payload = _decision_to_safe_dict(final, include_result=False)
+    payload["result"] = {
+        "query": query,
+        "mode": "message",
+        "hit_count": len(hits),
+        "summarized_count": accepted,
+        "skipped_count": len(hits) - accepted,
+        "messages": msg_records,
+    }
+    if final.allowed and isinstance(final.result, str):
+        payload["result"]["summary"] = final.result
+    _print_json(payload)
+    return _exit_code_for(final)
 
 
 def cmd_check_path(args: argparse.Namespace) -> int:
@@ -2862,6 +3390,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Permit a non-localhost --ollama-url",
     )
     ms.add_argument(
+        "--filter-since",
+        default=None,
+        help=(
+            "Drop messages whose Date header is before this YYYY-MM-DD "
+            "(inclusive, UTC; naive timestamps treated as UTC)."
+        ),
+    )
+    ms.add_argument(
+        "--filter-until",
+        default=None,
+        help=(
+            "Drop messages whose Date header is after this YYYY-MM-DD "
+            "(inclusive end-of-day UTC)."
+        ),
+    )
+    ms.add_argument(
         "--filter-subject",
         action="append",
         default=None,
@@ -2921,6 +3465,16 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=MAIL_DEFAULT_MAX_BODY,
         help="Per-message body size cap (default: 1 MiB)",
+    )
+    msr.add_argument(
+        "--filter-since",
+        default=None,
+        help="Drop messages dated before YYYY-MM-DD (UTC inclusive).",
+    )
+    msr.add_argument(
+        "--filter-until",
+        default=None,
+        help="Drop messages dated after YYYY-MM-DD (UTC end-of-day inclusive).",
     )
     msr.add_argument(
         "--filter-subject",
@@ -2997,6 +3551,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Permit a non-localhost --ollama-url",
     )
     md.add_argument(
+        "--filter-since",
+        default=None,
+        help="Drop messages dated before YYYY-MM-DD (UTC inclusive).",
+    )
+    md.add_argument(
+        "--filter-until",
+        default=None,
+        help="Drop messages dated after YYYY-MM-DD (UTC end-of-day inclusive).",
+    )
+    md.add_argument(
         "--filter-subject",
         action="append",
         default=None,
@@ -3031,6 +3595,149 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output format (default: json)",
     )
     md.set_defaults(func=cmd_mail_draft)
+
+    mt = sub.add_parser(
+        "mail-thread",
+        help=(
+            "Group local mail (.eml / .mbox / Maildir) into conversation "
+            "threads via Message-ID / In-Reply-To / References, with a "
+            "normalized-subject fallback."
+        ),
+    )
+    mt.add_argument(
+        "--path", required=True, help=".eml, .mbox, or Maildir directory"
+    )
+    mt.add_argument(
+        "--limit",
+        type=int,
+        default=MAIL_DEFAULT_MBOX_LIMIT,
+        help="Max messages to read from .mbox / Maildir (default: 10)",
+    )
+    mt.add_argument(
+        "--max-bytes",
+        type=int,
+        default=MAIL_DEFAULT_MAX_BODY,
+        help="Per-message body size cap (default: 1 MiB)",
+    )
+    mt.add_argument(
+        "--filter-since", default=None, help="Drop messages dated before YYYY-MM-DD."
+    )
+    mt.add_argument(
+        "--filter-until", default=None, help="Drop messages dated after YYYY-MM-DD."
+    )
+    mt.add_argument(
+        "--filter-subject", action="append", default=None,
+        help="Subject substring filter (repeatable: OR).",
+    )
+    mt.add_argument(
+        "--filter-from", action="append", default=None,
+        help="From substring filter (repeatable: OR).",
+    )
+    mt.add_argument(
+        "--filter-body-contains", action="append", default=None,
+        help="Body substring filter (repeatable: OR).",
+    )
+    mt.add_argument(
+        "--backend",
+        choices=("fake", "ollama"),
+        default="fake",
+        help="LLM backend for the audit gate (default: fake)",
+    )
+    mt.add_argument("--model", default=None, help="Ollama model name")
+    mt.add_argument("--ollama-url", default=None, help="Ollama server URL")
+    mt.add_argument(
+        "--allow-non-localhost-ollama",
+        action="store_true",
+        help="Permit a non-localhost --ollama-url",
+    )
+    mt.add_argument(
+        "--output", choices=("json", "text"), default="json",
+        help="Output format (default: json)",
+    )
+    mt.set_defaults(func=cmd_mail_thread)
+
+    mss = sub.add_parser(
+        "mail-search-summarize",
+        help=(
+            "Search local mail and summarize each matching message (or "
+            "thread with --threaded), then summarize the per-message / "
+            "per-thread summaries into one aggregate."
+        ),
+    )
+    mss.add_argument(
+        "--path", required=True, help=".eml, .mbox, or Maildir directory"
+    )
+    mss.add_argument("--query", required=True, help="Substring to search for")
+    mss.add_argument(
+        "--limit",
+        type=int,
+        default=MAIL_DEFAULT_MBOX_LIMIT,
+        help="Max messages to scan (default: 10)",
+    )
+    mss.add_argument(
+        "--max-hits",
+        type=int,
+        default=MAIL_SEARCH_DEFAULT_MAX_HITS,
+        help="Maximum hits to summarize (default: 10)",
+    )
+    mss.add_argument(
+        "--max-bytes",
+        type=int,
+        default=MAIL_DEFAULT_MAX_BODY,
+        help="Per-message body size cap (default: 1 MiB)",
+    )
+    mss.add_argument(
+        "--threaded",
+        action="store_true",
+        help=(
+            "Summarize the threads containing the hits, not just the "
+            "matching messages. Threads are built with build_threads."
+        ),
+    )
+    mss.add_argument(
+        "--include-per-message-summary",
+        action="store_true",
+        help=(
+            "JSON-only: attach each per-message (or per-thread) summary "
+            "under result.messages[].summary / result.threads[].summary."
+        ),
+    )
+    mss.add_argument(
+        "--filter-since", default=None, help="Drop messages dated before YYYY-MM-DD."
+    )
+    mss.add_argument(
+        "--filter-until", default=None, help="Drop messages dated after YYYY-MM-DD."
+    )
+    mss.add_argument(
+        "--filter-subject", action="append", default=None,
+        help="Subject filter (repeatable: OR).",
+    )
+    mss.add_argument(
+        "--filter-from", action="append", default=None,
+        help="From filter (repeatable: OR).",
+    )
+    mss.add_argument(
+        "--filter-body-contains", action="append", default=None,
+        help="Body filter (repeatable: OR).",
+    )
+    mss.add_argument(
+        "--backend",
+        choices=("fake", "ollama"),
+        default="fake",
+        help="LLM backend (default: fake)",
+    )
+    mss.add_argument("--model", default=None, help="Ollama model name")
+    mss.add_argument("--ollama-url", default=None, help="Ollama server URL")
+    mss.add_argument(
+        "--allow-non-localhost-ollama",
+        action="store_true",
+        help="Permit a non-localhost --ollama-url",
+    )
+    mss.add_argument(
+        "--output", choices=("json", "text"), default="json",
+        help="Output format (default: json)",
+    )
+    mss.set_defaults(func=cmd_mail_search_summarize)
 
     cp = sub.add_parser(
         "check-path",

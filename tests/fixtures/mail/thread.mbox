@@ -1,0 +1,72 @@
+From alice@example.invalid Tue May 21 09:00:00 2026
+From: Alice Example <alice@example.invalid>
+To: team@example.invalid
+Subject: Q3 planning kickoff
+Date: Tue, 21 May 2026 09:00:00 +0900
+Message-ID: <thread-001@example.invalid>
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+
+Hi team,
+
+Kicking off Q3 planning. Please block 90 minutes on Thursday.
+
+Alice
+
+From bob@example.invalid Tue May 21 10:30:00 2026
+From: Bob Example <bob@example.invalid>
+To: Alice Example <alice@example.invalid>
+Subject: Re: Q3 planning kickoff
+Date: Tue, 21 May 2026 10:30:00 +0900
+Message-ID: <thread-002@example.invalid>
+In-Reply-To: <thread-001@example.invalid>
+References: <thread-001@example.invalid>
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+
+Booked. I'll bring the Q2 metrics.
+
+Bob
+
+From carol@example.invalid Tue May 21 11:00:00 2026
+From: Carol Example <carol@example.invalid>
+To: Alice Example <alice@example.invalid>
+Cc: team@example.invalid
+Subject: Re: Q3 planning kickoff
+Date: Tue, 21 May 2026 11:00:00 +0900
+Message-ID: <thread-003@example.invalid>
+In-Reply-To: <thread-002@example.invalid>
+References: <thread-001@example.invalid> <thread-002@example.invalid>
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+
+I'll dial in remotely.
+
+Carol
+
+From dora@example.invalid Wed May 22 08:00:00 2026
+From: Dora Example <dora@example.invalid>
+To: Alice Example <alice@example.invalid>
+Subject: Office snacks restock
+Date: Wed, 22 May 2026 08:00:00 +0900
+Message-ID: <unrelated-001@example.invalid>
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+
+Reminder to restock the snacks tomorrow.
+
+Dora
+
+From eve@example.invalid Wed May 22 09:00:00 2026
+From: Eve Example <eve@example.invalid>
+To: Alice Example <alice@example.invalid>
+Subject: Office snacks: any preferences?
+Date: Wed, 22 May 2026 09:00:00 +0900
+Message-ID: <unrelated-002@example.invalid>
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+
+Same vendor as last time, or do we want to try the new place?
+
+Eve
+
