@@ -19,6 +19,7 @@ import email.utils
 import mailbox
 import re
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple, Union
@@ -63,6 +64,8 @@ class ParsedMail:
     content_type: str
     byte_size: int
     attachments: Tuple[AttachmentMeta, ...] = field(default_factory=tuple)
+    in_reply_to: Tuple[str, ...] = field(default_factory=tuple)
+    references: Tuple[str, ...] = field(default_factory=tuple)
 
 
 class _HTMLToText(HTMLParser):
@@ -246,6 +249,16 @@ def _extract_body(
     return (text, ct_used, has_attachments, tuple(attachments))
 
 
+_MSGID_RE = re.compile(r"<[^>]+>")
+
+
+def _extract_message_id_list(value: str) -> Tuple[str, ...]:
+    """Return all <...> message-id tokens from a header value."""
+    if not value:
+        return ()
+    return tuple(_MSGID_RE.findall(value))
+
+
 def _parsed_from_message(
     msg: email.message.Message,
     *,
@@ -257,6 +270,8 @@ def _parsed_from_message(
     cc = msg.get("Cc", "") or ""
     date = msg.get("Date", "") or ""
     message_id = msg.get("Message-ID", "") or msg.get("Message-Id", "") or ""
+    in_reply_to = _extract_message_id_list(msg.get("In-Reply-To", "") or "")
+    references = _extract_message_id_list(msg.get("References", "") or "")
     body, content_type, has_attachments, attachments = _extract_body(
         msg, max_bytes=max_bytes
     )
@@ -272,6 +287,8 @@ def _parsed_from_message(
         content_type=content_type,
         byte_size=len(body.encode("utf-8")),
         attachments=attachments,
+        in_reply_to=in_reply_to,
+        references=references,
     )
 
 
@@ -351,6 +368,81 @@ def _pass_three_filters(
     return True
 
 
+def _parse_filter_date(date_str: str) -> datetime:
+    """Parse a YYYY-MM-DD CLI date string into a tz-aware UTC datetime.
+
+    Raises ValueError if the format does not match.
+    """
+    if not date_str or not isinstance(date_str, str):
+        raise ValueError("date string is empty")
+    try:
+        # strptime accepts the format but produces a naive datetime; we
+        # explicitly attach UTC so comparisons against parsed email
+        # dates are unambiguous.
+        return datetime.strptime(date_str, "%Y-%m-%d").replace(
+            tzinfo=timezone.utc
+        )
+    except ValueError as exc:
+        raise ValueError(
+            f"invalid date {date_str!r} (expected YYYY-MM-DD): {exc}"
+        ) from exc
+
+
+def _parse_mail_date(date_header: str) -> Optional[datetime]:
+    """Parse an RFC 2822 Date: header. Returns a UTC datetime or None.
+
+    Naive datetimes (no tz in the header) are coerced to UTC; the docs
+    call this out.
+    """
+    if not date_header:
+        return None
+    try:
+        dt = email.utils.parsedate_to_datetime(date_header)
+    except (TypeError, ValueError):
+        return None
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+@dataclass(frozen=True)
+class DateFilter:
+    since: Optional[datetime] = None
+    until: Optional[datetime] = None
+
+    def is_empty(self) -> bool:
+        return self.since is None and self.until is None
+
+
+def _date_filter_matches(
+    pm: ParsedMail, df: DateFilter
+) -> Tuple[bool, Optional[str]]:
+    """Return (passes, skip_reason).
+
+    If the filter is empty, returns (True, None).
+    If the mail has no parseable date and a filter is active, returns
+    (False, "unparseable date") so the caller can log a skip warning.
+    """
+    if df.is_empty():
+        return (True, None)
+    dt = _parse_mail_date(pm.date)
+    if dt is None:
+        return (False, "date header missing or unparseable")
+    if df.since is not None and dt < df.since:
+        return (False, None)  # silently outside range
+    if df.until is not None:
+        # until is inclusive on the day: treat YYYY-MM-DD as the END of
+        # that day so a same-day match is allowed.
+        until_end = df.until.replace(
+            hour=23, minute=59, second=59, microsecond=999999
+        )
+        if dt > until_end:
+            return (False, None)
+    return (True, None)
+
+
 def read_mbox(
     path: Path,
     *,
@@ -359,6 +451,7 @@ def read_mbox(
     filter_subject: FilterArg = None,
     filter_from: FilterArg = None,
     filter_body_contains: FilterArg = None,
+    date_filter: Optional[DateFilter] = None,
 ) -> MboxReadResult:
     if not isinstance(path, Path):
         path = Path(path)
@@ -375,6 +468,7 @@ def read_mbox(
 
     parsed: List[ParsedMail] = []
     skipped: List[str] = []
+    df = date_filter or DateFilter()
     try:
         for key, raw_msg in mb.items():
             if len(parsed) >= limit:
@@ -390,6 +484,11 @@ def read_mbox(
                 filter_from=filter_from,
                 filter_body_contains=filter_body_contains,
             ):
+                continue
+            passes, reason = _date_filter_matches(pm, df)
+            if not passes:
+                if reason is not None:
+                    skipped.append(f"message {key}: {reason}")
                 continue
             parsed.append(pm)
     finally:
@@ -430,6 +529,7 @@ def read_maildir(
     filter_subject: FilterArg = None,
     filter_from: FilterArg = None,
     filter_body_contains: FilterArg = None,
+    date_filter: Optional[DateFilter] = None,
 ) -> MboxReadResult:
     if not isinstance(path, Path):
         path = Path(path)
@@ -448,10 +548,16 @@ def read_maildir(
 
     parsed: List[ParsedMail] = []
     skipped: List[str] = []
+    df = date_filter or DateFilter()
     try:
         for key, raw_msg in md.items():
             if len(parsed) >= limit:
                 break
+            # Maildir spec reserves filenames without a leading "."; skip
+            # any dotfiles (e.g., .gitkeep, .DS_Store, .uidvalidity) so
+            # filesystem housekeeping does not appear as a message.
+            if key.startswith("."):
+                continue
             try:
                 pm = _parsed_from_message(raw_msg, max_bytes=max_bytes)
             except MailReadError as exc:
@@ -463,6 +569,11 @@ def read_maildir(
                 filter_from=filter_from,
                 filter_body_contains=filter_body_contains,
             ):
+                continue
+            passes, reason = _date_filter_matches(pm, df)
+            if not passes:
+                if reason is not None:
+                    skipped.append(f"message {key}: {reason}")
                 continue
             parsed.append(pm)
     finally:
@@ -483,6 +594,7 @@ def read_mail_any(
     filter_subject: FilterArg = None,
     filter_from: FilterArg = None,
     filter_body_contains: FilterArg = None,
+    date_filter: Optional[DateFilter] = None,
 ) -> MboxReadResult:
     """Convenience: auto-detect .eml / .mbox / Maildir directory.
 
@@ -501,6 +613,7 @@ def read_mail_any(
                 filter_subject=filter_subject,
                 filter_from=filter_from,
                 filter_body_contains=filter_body_contains,
+                date_filter=date_filter,
             )
         raise MailReadError(
             "directory is not a Maildir (missing cur/ new/ tmp/)",
@@ -515,6 +628,7 @@ def read_mail_any(
             filter_subject=filter_subject,
             filter_from=filter_from,
             filter_body_contains=filter_body_contains,
+            date_filter=date_filter,
         )
     if suffix == ".eml" or suffix == "":
         pm = read_eml(path, max_bytes=max_bytes)
@@ -525,6 +639,11 @@ def read_mail_any(
             filter_body_contains=filter_body_contains,
         ):
             return MboxReadResult(messages=())
+        df = date_filter or DateFilter()
+        passes, reason = _date_filter_matches(pm, df)
+        if not passes:
+            skipped = (f"message {path.name}: {reason}",) if reason else ()
+            return MboxReadResult(messages=(), skipped=skipped)
         return MboxReadResult(messages=(pm,))
     # Unknown extension — try .eml semantics.
     pm = read_eml(path, max_bytes=max_bytes)

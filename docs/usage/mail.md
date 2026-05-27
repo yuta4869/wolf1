@@ -8,14 +8,20 @@ pipeline used by the file-summarize commands.
 
 ## What's covered
 
-- `mail-summarize` — summarize one `.eml` or up to `--limit`
-  messages from a `.mbox`.
+- `mail-summarize` — summarize one `.eml`, up to `--limit` messages
+  from a `.mbox`, or messages from a Maildir directory.
 - `mail-search` — substring search across subject / from / body of
   local mail.
 - `mail-draft` — generate a reply draft using an explicit
   `--instruction` (trusted) plus the mail body (untrusted).
   Nothing is sent; the draft body is returned in the JSON
   envelope (or printed to stdout in text mode).
+- `mail-thread` (PR #25) — group messages into conversation threads
+  via `Message-ID` / `In-Reply-To` / `References` with a
+  normalized-subject fallback.
+- `mail-search-summarize` (PR #25) — run a search and summarize each
+  matching message (or thread with `--threaded`), then summarize the
+  per-message / per-thread summaries into one aggregate.
 
 The mail body is always wrapped as `UntrustedText(source=email)` so
 the prompt-injection scan runs on it. Mail subcommands run in
@@ -24,8 +30,9 @@ also block, not just critical markers.
 
 ## Filters
 
-All three mail subcommands (`mail-summarize`, `mail-search`,
-`mail-draft`) accept the same three pre-filter flags:
+All five mail subcommands (`mail-summarize`, `mail-search`,
+`mail-draft`, `mail-thread`, `mail-search-summarize`) accept the same
+pre-filter flags:
 
 - `--filter-subject SUBSTR`
 - `--filter-from SUBSTR`
@@ -53,14 +60,60 @@ For `mail-draft` filters narrow the candidate list **before**
 the first filtered message.
 
 Exit-2 semantics when filters drop everything:
-- `mail-search` with empty candidate set → `stage=search`
-  `result.message_count=0`.
-- `mail-summarize` with empty candidate set → `stage=mail_read`
-  `reason="no messages"`.
+- `mail-search` / `mail-search-summarize` with empty candidate set →
+  `stage=search` `result.message_count=0`.
+- `mail-summarize` / `mail-thread` with empty candidate set →
+  `stage=mail_read` `reason="no messages"`.
 - `mail-draft` with empty candidate set → `stage=mail_read`
   `reason="no messages"`.
 - `mail-draft` with non-empty candidate set but `--message-index`
   out of range → `stage=mail_read` `reason="message_index out of range"`.
+
+## Datetime filters (PR #25)
+
+In addition to the substring filters above, all mail subcommands
+accept `--filter-since YYYY-MM-DD` and `--filter-until YYYY-MM-DD`:
+
+- `--filter-since` is the **start** of the named UTC day (inclusive).
+- `--filter-until` is the **end** of the named UTC day (inclusive),
+  i.e. `YYYY-MM-DD 23:59:59.999999 UTC`.
+- The mail's `Date:` header is parsed with
+  `email.utils.parsedate_to_datetime`. Timezone-naive timestamps are
+  treated as UTC.
+- A message whose Date header is missing or unparseable is **skipped**
+  (with a warning recorded in `result.skipped`) when either flag is
+  set; without the flag those messages pass through unchanged.
+- An invalid CLI date (e.g., `--filter-since not-a-date`) exits 2
+  before any mail is read; the stderr message names the offending
+  argument.
+
+## Threading (PR #25)
+
+`mail-thread` groups the messages it reads into conversation threads
+using:
+
+1. `Message-ID`, `In-Reply-To`, and `References` headers (union-find
+   over the lineage graph).
+2. Normalized subject as a fallback: strip leading `Re:` / `Fwd:` /
+   `FW:` / `AW:` prefixes, lowercase, and collapse whitespace.
+   Messages with the same normalized subject share a root.
+
+Each thread JSON record carries `thread_id`, `subject`,
+`message_count`, `participants`, `first_date`, `last_date`, and a
+`messages[]` array with `index` (into the source mailbox), `subject`,
+`from`, `date`, `message_id`. Bodies are NOT included; callers who
+need a body re-read the source mail at the given index.
+
+`mail-search-summarize --threaded` reuses the same threader: hits are
+matched to threads, each thread's messages are concatenated, and the
+Router summarizes them per-thread. The aggregate then summarizes the
+per-thread summaries.
+
+For the aggregate step the Router is configured with
+`allow_warning_injection_findings=True` because the input is the
+LLM's own per-message / per-thread output (which often contains
+benign warning markers like the word "command"). Critical markers
+still block.
 
 ## File support
 
@@ -129,6 +182,26 @@ PYTHONPATH=src python3 -m wolf.cli mail-draft \
     --message-index 2 \
     --instruction "短く確認の返事をして" \
     --backend ollama --model llama3.1
+
+# Group an .mbox into conversation threads (no summarization).
+PYTHONPATH=src python3 -m wolf.cli mail-thread \
+    --path ./tests/fixtures/mail/thread.mbox
+
+# Search + per-message summary in one shot.
+PYTHONPATH=src python3 -m wolf.cli mail-search-summarize \
+    --path ./tests/fixtures/mail/sample.mbox \
+    --query meeting --backend fake
+
+# Search + per-thread summary (groups hits into threads first).
+PYTHONPATH=src python3 -m wolf.cli mail-search-summarize \
+    --path ./tests/fixtures/mail/thread.mbox \
+    --query planning --threaded --backend fake
+
+# Restrict to a UTC date window before summarizing.
+PYTHONPATH=src python3 -m wolf.cli mail-summarize \
+    --path ./mail/inbox.mbox \
+    --filter-since 2026-05-01 --filter-until 2026-05-31 \
+    --backend fake
 ```
 
 ## JSON output shape
@@ -193,6 +266,94 @@ PYTHONPATH=src python3 -m wolf.cli mail-draft \
   }
 }
 ```
+
+### `mail-thread`
+
+```json
+{
+  "stage": "complete",
+  "result": {
+    "thread_count": 3,
+    "threads": [
+      {
+        "thread_id": "<thread-001@example.invalid>",
+        "subject": "Q3 planning kickoff",
+        "message_count": 3,
+        "participants": ["Alice Example <...>", "Bob Example <...>", "Carol Example <...>"],
+        "first_date": "Tue, 21 May 2026 09:00:00 +0900",
+        "last_date": "Tue, 21 May 2026 11:00:00 +0900",
+        "messages": [
+          {
+            "index": 0,
+            "subject": "Q3 planning kickoff",
+            "from": "Alice Example <...>",
+            "date": "Tue, 21 May 2026 09:00:00 +0900",
+            "message_id": "<thread-001@example.invalid>"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+### `mail-search-summarize`
+
+Per-message mode (default):
+
+```json
+{
+  "stage": "complete",
+  "result": {
+    "mode": "message",
+    "query": "meeting",
+    "hit_count": 2,
+    "summarized_count": 2,
+    "skipped_count": 0,
+    "summary": "Aggregate summary across hits...",
+    "messages": [
+      {
+        "message_id": "<...>",
+        "subject": "...",
+        "from": "...",
+        "date": "...",
+        "match_field": "subject",
+        "match_count": 1,
+        "summary_length": 272
+      }
+    ]
+  }
+}
+```
+
+Per-thread mode (`--threaded`):
+
+```json
+{
+  "stage": "complete",
+  "result": {
+    "mode": "threaded",
+    "query": "planning",
+    "hit_count": 3,
+    "summarized_count": 1,
+    "skipped_count": 0,
+    "summary": "Aggregate summary across threads...",
+    "threads": [
+      {
+        "thread_id": "<thread-001@example.invalid>",
+        "subject": "Q3 planning kickoff",
+        "message_count": 3,
+        "participants": ["Alice Example <...>", "Bob Example <...>", "Carol Example <...>"],
+        "summary_length": 272
+      }
+    ]
+  }
+}
+```
+
+Per-message and per-thread summary *bodies* are not returned to keep
+the JSON envelope small; their lengths appear as `summary_length`.
+The aggregate `summary` field carries the full Router-mediated text.
 
 ## Privacy posture
 

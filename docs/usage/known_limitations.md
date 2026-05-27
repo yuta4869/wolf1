@@ -68,11 +68,28 @@ documented as out of scope.
 
 - **No Gmail / IMAP / SMTP / mail send.** v0.2 adds local `.eml`
   and `.mbox` read / search / draft via `mail-summarize`,
-  `mail-search`, `mail-draft` (PR #22). The original
+  `mail-search`, `mail-draft` (PR #22), and v0.3 adds local
+  threading + combined search-summarize via `mail-thread` and
+  `mail-search-summarize` (PR #25). The original
   `summarize-email --text "..."` command also remains. None of
   these connect to any mailbox, send any mail, or save anything to
   disk. The draft command returns the proposed reply body in
   JSON; the user is responsible for actually sending it.
+- **Datetime filtering is UTC-only and date-granular.** All five
+  mail subcommands accept `--filter-since YYYY-MM-DD` and
+  `--filter-until YYYY-MM-DD` (PR #25). `since` is the start and
+  `until` is the end of the named UTC day (inclusive). Message
+  `Date:` headers without timezone info are treated as UTC. Mail
+  whose Date header is missing or unparseable is skipped when
+  either flag is set. There is no time-of-day, no per-timezone
+  filter, and no "last 7 days" relative shorthand.
+- **Mail threading is heuristic, not authoritative.** `mail-thread`
+  (and `mail-search-summarize --threaded`) cluster messages using
+  `Message-ID` / `In-Reply-To` / `References` plus a
+  normalized-subject fallback (`Re:` / `Fwd:` / `FW:` / `AW:`
+  stripping). Forwarded mails that drop the lineage headers may
+  end up in the wrong cluster, and unrelated mail that happens to
+  share a subject after normalization will collide.
 - **No `.msg` (Outlook), PGP / S/MIME, or attachment content
   extraction.** Mail attachments carry filename / content_type /
   size_bytes metadata only; their bytes are never read into the
