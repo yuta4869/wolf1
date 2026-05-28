@@ -4143,5 +4143,328 @@ class GmailSearchSummarizeThreadIdAndTraceTest(unittest.TestCase):
             self.assertNotIn("body_text", tr)
 
 
+class QueryFingerprintTest(unittest.TestCase):
+    """PR #29: _query_fingerprint helper + audit event integration."""
+
+    def test_helper_is_deterministic(self) -> None:
+        from wolf.cli import _query_fingerprint
+        self.assertEqual(
+            _query_fingerprint("meeting"),
+            _query_fingerprint("meeting"),
+        )
+
+    def test_helper_strips_whitespace(self) -> None:
+        from wolf.cli import _query_fingerprint
+        self.assertEqual(
+            _query_fingerprint("meeting"),
+            _query_fingerprint("  meeting  "),
+        )
+
+    def test_helper_none_returns_none(self) -> None:
+        from wolf.cli import _query_fingerprint
+        self.assertIsNone(_query_fingerprint(None))
+        self.assertIsNone(_query_fingerprint(""))
+        self.assertIsNone(_query_fingerprint("   "))
+
+    def test_helper_returns_12_hex_chars(self) -> None:
+        from wolf.cli import _query_fingerprint
+        fp = _query_fingerprint("meeting")
+        self.assertEqual(len(fp), 12)
+        # Hex characters only.
+        for c in fp:
+            self.assertIn(c, "0123456789abcdef")
+
+    def test_different_queries_get_different_fingerprints(self) -> None:
+        from wolf.cli import _query_fingerprint
+        a = _query_fingerprint("meeting")
+        b = _query_fingerprint("from:alice meeting")
+        self.assertNotEqual(a, b)
+
+
+class GmailAuditQueryFingerprintTest(unittest.TestCase):
+    """PR #29: every gmail-* audit event with a query carries
+    query_fingerprint and never the query content."""
+
+    def setUp(self) -> None:
+        self.fixture = _ProjectFixture()
+
+    def tearDown(self) -> None:
+        self.fixture.cleanup()
+
+    def _audit_path(self):
+        return self.fixture.root / "var" / "audit" / "audit.jsonl"
+
+    def _events(self):
+        p = self._audit_path()
+        if not p.exists():
+            return []
+        with p.open("r", encoding="utf-8") as f:
+            return [json.loads(line) for line in f if line.strip()]
+
+    def _run(self, *extra_args: str):
+        return _run_inproc(
+            [
+                "--project-root", str(self.fixture.root),
+                *extra_args,
+            ]
+        )
+
+    def _last_event_of_kind(self, kind: str):
+        evs = [e for e in self._events() if e["action_kind"] == kind]
+        return evs[-1] if evs else None
+
+    def test_gmail_search_has_fingerprint(self) -> None:
+        # gmail-search writes an audit event regardless of hit count
+        # (the search itself happened), so a non-matching unique
+        # marker is OK here.
+        code, _, _ = self._run(
+            "gmail-search", "--gmail-backend", "fake",
+            "--query", "UNIQUE-PR29-SEARCH-MARKER",
+        )
+        self.assertEqual(code, EXIT_SUCCESS)
+        ev = self._last_event_of_kind("gmail.search")
+        self.assertIsNotNone(ev)
+        d = ev["detail"]
+        self.assertIn("query_fingerprint", d)
+        self.assertEqual(len(d["query_fingerprint"]), 12)
+        text = self._audit_path().read_text(encoding="utf-8")
+        self.assertNotIn("UNIQUE-PR29-SEARCH-MARKER", text)
+
+    def test_gmail_thread_has_fingerprint_in_query_mode(self) -> None:
+        # "meeting" matches the fixture; UNIQUE-PR29-MARKER must not
+        # appear anywhere in the audit file (only its fingerprint).
+        code, _, _ = self._run(
+            "gmail-thread", "--gmail-backend", "fake",
+            "--query", "meeting UNIQUE-PR29-THREAD-MARKER",
+        )
+        self.assertEqual(code, EXIT_SUCCESS)
+        ev = self._last_event_of_kind("gmail.thread")
+        self.assertIsNotNone(ev)
+        self.assertIn("query_fingerprint", ev["detail"])
+        self.assertEqual(len(ev["detail"]["query_fingerprint"]), 12)
+        text = self._audit_path().read_text(encoding="utf-8")
+        self.assertNotIn("UNIQUE-PR29-THREAD-MARKER", text)
+
+    def test_gmail_thread_fingerprint_is_null_for_thread_id_mode(self) -> None:
+        code, _, _ = self._run(
+            "gmail-thread", "--gmail-backend", "fake", "--thread-id", "thread_1",
+        )
+        self.assertEqual(code, EXIT_SUCCESS)
+        ev = self._last_event_of_kind("gmail.thread")
+        self.assertIsNotNone(ev)
+        self.assertIsNone(ev["detail"]["query_fingerprint"])
+        self.assertEqual(ev["detail"]["query_length"], 0)
+
+    def test_gmail_search_summarize_has_fingerprint(self) -> None:
+        code, _, _ = self._run(
+            "gmail-search-summarize",
+            "--gmail-backend", "fake",
+            "--query", "meeting UNIQUE-PR29-GSS-MARKER",
+            "--llm-backend", "fake",
+        )
+        self.assertEqual(code, EXIT_SUCCESS)
+        ev = self._last_event_of_kind("gmail.search_summarize")
+        self.assertIsNotNone(ev)
+        self.assertEqual(len(ev["detail"]["query_fingerprint"]), 12)
+        text = self._audit_path().read_text(encoding="utf-8")
+        self.assertNotIn("UNIQUE-PR29-GSS-MARKER", text)
+
+
+class GmailSummarizeAuditTest(unittest.TestCase):
+    """PR #29: cmd_gmail_summarize now writes gmail.summarize audit."""
+
+    def setUp(self) -> None:
+        self.fixture = _ProjectFixture()
+
+    def tearDown(self) -> None:
+        self.fixture.cleanup()
+
+    def _audit_path(self):
+        return self.fixture.root / "var" / "audit" / "audit.jsonl"
+
+    def _events(self):
+        p = self._audit_path()
+        if not p.exists():
+            return []
+        with p.open("r", encoding="utf-8") as f:
+            return [json.loads(line) for line in f if line.strip()]
+
+    def _run(self, *extra_args: str):
+        return _run_inproc(
+            ["--project-root", str(self.fixture.root), *extra_args]
+        )
+
+    def test_summarize_query_emits_audit(self) -> None:
+        code, _, _ = self._run(
+            "gmail-summarize",
+            "--gmail-backend", "fake",
+            "--query", "meeting",
+            "--llm-backend", "fake",
+        )
+        self.assertEqual(code, EXIT_SUCCESS)
+        kinds = [e["action_kind"] for e in self._events()]
+        self.assertIn("gmail.summarize", kinds)
+        ev = next(e for e in reversed(self._events()) if e["action_kind"] == "gmail.summarize")
+        d = ev["detail"]
+        self.assertEqual(d["provider"], "fake")
+        self.assertEqual(d["llm_backend"], "fake")
+        self.assertEqual(d["input_mode"], "query")
+        self.assertGreater(d["searched_count"], 0)
+        self.assertGreater(d["summarized_count"], 0)
+
+    def test_summarize_message_id_emits_audit(self) -> None:
+        code, _, _ = self._run(
+            "gmail-summarize",
+            "--gmail-backend", "fake",
+            "--message-id", "msg_1",
+            "--llm-backend", "fake",
+        )
+        self.assertEqual(code, EXIT_SUCCESS)
+        ev = next(
+            (e for e in reversed(self._events()) if e["action_kind"] == "gmail.summarize"),
+            None,
+        )
+        self.assertIsNotNone(ev)
+        self.assertEqual(ev["detail"]["input_mode"], "message_id")
+        self.assertEqual(ev["detail"]["searched_count"], 0)
+
+    def test_audit_has_no_body_or_token(self) -> None:
+        # Use a hitting + unique query so the run succeeds and the
+        # audit file actually exists.
+        unique = "ZZZ-PR29-SUMMARIZE-UNIQ-TAIL"
+        code, _, _ = self._run(
+            "gmail-summarize",
+            "--gmail-backend", "fake",
+            "--query", f"meeting {unique}",
+            "--llm-backend", "fake",
+        )
+        self.assertEqual(code, EXIT_SUCCESS)
+        text = self._audit_path().read_text(encoding="utf-8")
+        self.assertNotIn(unique, text)
+        self.assertNotIn("Kicking off Q3 planning", text)
+        self.assertNotIn("Bearer ", text)
+        # Ensure audit event was emitted.
+        kinds = [e["action_kind"] for e in self._events()]
+        self.assertIn("gmail.summarize", kinds)
+
+    def test_audit_failure_returns_audit_log_stage(self) -> None:
+        from unittest.mock import patch
+
+        with patch(
+            "wolf.cli._audit_gmail_api_event",
+            side_effect=OSError("disk"),
+        ):
+            code, out, _ = self._run(
+                "gmail-summarize",
+                "--gmail-backend", "fake",
+                "--message-id", "msg_1",
+                "--llm-backend", "fake",
+            )
+        self.assertEqual(code, EXIT_DENIED)
+        payload = json.loads(out)
+        self.assertEqual(payload["stage"], "audit_log")
+
+
+class AuditTailCliTest(unittest.TestCase):
+    """PR #29: audit-tail subcommand."""
+
+    def setUp(self) -> None:
+        self.fixture = _ProjectFixture()
+
+    def tearDown(self) -> None:
+        self.fixture.cleanup()
+
+    def _run(self, *extra_args: str):
+        return _run_inproc(
+            ["--project-root", str(self.fixture.root), *extra_args]
+        )
+
+    def _audit_path(self):
+        return self.fixture.root / "var" / "audit" / "audit.jsonl"
+
+    def test_missing_audit_file_returns_empty(self) -> None:
+        code, out, _ = self._run("audit-tail")
+        self.assertEqual(code, EXIT_SUCCESS, msg=out)
+        payload = json.loads(out)
+        self.assertEqual(payload["result"]["event_count"], 0)
+        self.assertFalse(payload["result"]["audit_exists"])
+
+    def test_text_mode_missing_audit(self) -> None:
+        code, out, _ = self._run("audit-tail", "--output", "text")
+        self.assertEqual(code, EXIT_SUCCESS)
+        self.assertIn("no audit events", out)
+
+    def test_text_mode_after_gmail_search(self) -> None:
+        self._run(
+            "gmail-search", "--gmail-backend", "fake", "--query", "meeting",
+        )
+        code, out, _ = self._run("audit-tail", "--output", "text")
+        self.assertEqual(code, EXIT_SUCCESS, msg=out)
+        self.assertIn("gmail.search", out)
+
+    def test_action_kind_filter(self) -> None:
+        # Generate two distinct events.
+        self._run(
+            "gmail-search", "--gmail-backend", "fake", "--query", "meeting",
+        )
+        self._run(
+            "gmail-read", "--gmail-backend", "fake", "--message-id", "msg_1",
+        )
+        code, out, _ = self._run(
+            "audit-tail", "--action-kind", "gmail.read",
+        )
+        self.assertEqual(code, EXIT_SUCCESS, msg=out)
+        payload = json.loads(out)
+        kinds = {e["action_kind"] for e in payload["result"]["events"]}
+        self.assertEqual(kinds, {"gmail.read"})
+
+    def test_limit_caps_event_count(self) -> None:
+        self._run(
+            "gmail-search", "--gmail-backend", "fake", "--query", "meeting",
+        )
+        self._run(
+            "gmail-read", "--gmail-backend", "fake", "--message-id", "msg_1",
+        )
+        self._run(
+            "gmail-thread", "--gmail-backend", "fake", "--query", "meeting",
+        )
+        code, out, _ = self._run("audit-tail", "--limit", "1")
+        self.assertEqual(code, EXIT_SUCCESS, msg=out)
+        payload = json.loads(out)
+        self.assertEqual(payload["result"]["event_count"], 1)
+
+    def test_malformed_jsonl_line_skipped(self) -> None:
+        # Pre-create a corrupt audit file.
+        ap = self._audit_path()
+        ap.parent.mkdir(parents=True, exist_ok=True)
+        ap.write_text(
+            '{"action_kind":"gmail.search","outcome":"ok"}\n'
+            "this is not json\n"
+            '{"action_kind":"gmail.read","outcome":"ok"}\n',
+            encoding="utf-8",
+        )
+        code, out, err = self._run("audit-tail")
+        self.assertEqual(code, EXIT_SUCCESS, msg=out)
+        payload = json.loads(out)
+        self.assertEqual(payload["result"]["event_count"], 2)
+        self.assertIn("skipped 1 malformed", err)
+
+    def test_no_body_or_token_sentinel_in_output(self) -> None:
+        # gmail-draft writes an audit event; ensure audit-tail does not
+        # re-inject a body or token even when the source audit file
+        # legitimately doesn't carry them.
+        self._run(
+            "gmail-draft",
+            "--gmail-backend", "fake",
+            "--message-id", "msg_1",
+            "--instruction", "ok",
+            "--llm-backend", "fake",
+        )
+        code, out, _ = self._run("audit-tail")
+        self.assertEqual(code, EXIT_SUCCESS)
+        self.assertNotIn("Kicking off Q3 planning", out)
+        self.assertNotIn("Bearer ", out)
+
+
 if __name__ == "__main__":
     unittest.main()

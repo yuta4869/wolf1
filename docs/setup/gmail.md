@@ -133,13 +133,22 @@ out of scope for this PR.
 
 - Tokens expire. The expected failure mode is
   `gmail:*: HTTP 401`. Re-issue the token and retry.
-- **PR #28 broadens audit coverage.** Every `gmail-*` command
-  writes one event to `var/audit/audit.jsonl`:
-  `gmail.search`, `gmail.read`, `gmail.thread`,
+- **PR #28 broadens audit coverage; PR #29 closes the parity
+  gap.** Every `gmail-*` command writes one event to
+  `var/audit/audit.jsonl`: `gmail.search`, `gmail.read`,
+  `gmail.thread`, `gmail.summarize`,
   `gmail.search_summarize`, `gmail.create_draft`. Each event
   carries only metadata (provider, counts, ids, lengths). The
   access token, raw mail body, draft body, and the search
-  query string itself are NEVER recorded.
+  query string itself are NEVER recorded. PR #29 also adds a
+  `query_fingerprint` (SHA-256 first 12 hex) so two runs of
+  the same query can be correlated in the audit log without
+  storing the query content.
+- **Inspecting the audit log.** PR #29 adds `audit-tail`:
+  ```sh
+  python -m wolf.cli audit-tail --limit 20 --output text
+  python -m wolf.cli audit-tail --action-kind gmail.search
+  ```
 - `AuditLogger._mask()` additionally redacts any key matching
   `token` / `credential` / `secret` / `auth` etc., so an
   accidental field would be redacted on write.
