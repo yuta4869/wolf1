@@ -66,15 +66,27 @@ documented as out of scope.
 
 ## Integrations
 
-- **No Gmail / IMAP / SMTP / mail send.** v0.2 adds local `.eml`
-  and `.mbox` read / search / draft via `mail-summarize`,
-  `mail-search`, `mail-draft` (PR #22), and v0.3 adds local
-  threading + combined search-summarize via `mail-thread` and
-  `mail-search-summarize` (PR #25). The original
-  `summarize-email --text "..."` command also remains. None of
-  these connect to any mailbox, send any mail, or save anything to
-  disk. The draft command returns the proposed reply body in
-  JSON; the user is responsible for actually sending it.
+- **Gmail: read + draft only. Never send.** PR #26 adds opt-in
+  Gmail integration via `gmail-search`, `gmail-read`,
+  `gmail-summarize`, and `gmail-draft`. The CLI calls the Gmail
+  REST API over `urllib` (stdlib only); no `google-api-python-client`
+  is bundled. There is **no** `users.messages.send`, no SMTP, no
+  IMAP. `gmail-draft` creates a Gmail draft via
+  `users.drafts.create`; you must finish or discard it inside
+  Gmail yourself. The default backend is the in-memory
+  `FakeGmailClient`; the real backend requires an explicit
+  `--credentials-path` to a JSON file with `{"access_token": "..."}`.
+  No OAuth browser login; no refresh-token flow. The token is
+  never refreshed by this CLI.
+- **Local mail (`.eml` / `.mbox` / Maildir) does not send either.**
+  v0.2 added local `.eml` and `.mbox` read / search / draft via
+  `mail-summarize`, `mail-search`, `mail-draft` (PR #22), and
+  v0.3 added local threading + combined search-summarize via
+  `mail-thread` and `mail-search-summarize` (PR #25). The
+  original `summarize-email --text "..."` command also remains.
+  None of these connect to any mailbox, send any mail, or save
+  anything to disk. The draft command returns the proposed reply
+  body in JSON; the user is responsible for actually sending it.
 - **Datetime filtering is UTC-only and date-granular.** All five
   mail subcommands accept `--filter-since YYYY-MM-DD` and
   `--filter-until YYYY-MM-DD` (PR #25). `since` is the start and

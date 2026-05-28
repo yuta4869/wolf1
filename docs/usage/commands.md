@@ -257,6 +257,69 @@ python -m wolf.cli summarize-email --text "..." [options]
 Key flags: `--text TEXT` (required), `--backend`, `--model`,
 `--ollama-url`, `--allow-non-localhost-ollama`.
 
+### `gmail-search` (PR #26)
+
+Search Gmail (or the in-memory fake) and return enriched
+metadata. No body bytes in the output beyond `snippet`.
+
+```sh
+python -m wolf.cli gmail-search --gmail-backend fake --query TEXT
+```
+
+Key flags: `--query TEXT` (required), `--limit N` (default 10),
+`--gmail-backend {fake,gmail}` (default `fake`),
+`--credentials-path PATH` (required for `gmail`),
+`--gmail-base-url URL`, `--allow-non-https-gmail`,
+`--no-enrich` (skip per-message header lookup),
+`--output {json,text}`.
+
+### `gmail-read` (PR #26)
+
+Read one Gmail message and return metadata + a bounded
+`body_preview`. The full body is never returned.
+
+```sh
+python -m wolf.cli gmail-read --gmail-backend fake --message-id ID
+```
+
+Key flags: `--message-id ID` (required), `--gmail-backend`,
+`--credentials-path`, `--gmail-base-url`, `--allow-non-https-gmail`,
+`--body-preview-bytes N` (default 500), `--output`.
+
+### `gmail-summarize` (PR #26)
+
+Search and/or read Gmail messages and summarize each via the
+Router pipeline (mail-strict). No send.
+
+```sh
+python -m wolf.cli gmail-summarize \
+    --gmail-backend fake --query TEXT --llm-backend fake
+```
+
+Key flags: `--query TEXT` OR `--message-id ID`, `--limit N`,
+Gmail flags as above, plus the LLM flags
+`--llm-backend {fake,ollama}` (default `fake`), `--model NAME`
+(required for `ollama`), `--ollama-url`,
+`--allow-non-localhost-ollama`, `--output`.
+
+### `gmail-draft` (PR #26)
+
+Read one Gmail message, draft a reply via the LLM, and create
+the draft on Gmail (or the fake). NEVER sends.
+
+```sh
+python -m wolf.cli gmail-draft \
+    --gmail-backend fake --message-id ID \
+    --instruction "..." --llm-backend fake
+```
+
+Key flags: `--message-id ID` (required), `--instruction TEXT`
+(required, treated as trusted), Gmail flags as above, LLM flags
+as above, `--body-preview-bytes N` (default 500), `--output`.
+JSON `result` carries `draft_id`, `message_id`, `thread_id`,
+`subject_suggestion`, `body_preview`, `body_truncated`. See
+`docs/usage/gmail.md` for the full shape.
+
 ### `check-path`
 
 Run `ProjectBoundaryGuard` + `SensitivePathGuard` on a path. Does

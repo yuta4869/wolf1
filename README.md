@@ -13,6 +13,15 @@ shipped after PR #1 through PR #21.
 - `mail-summarize` / `mail-search` / `mail-draft` for local `.eml`
   and `.mbox` files (PR #22). Read-only. No Gmail / IMAP / SMTP /
   send. See [`docs/usage/mail.md`](docs/usage/mail.md).
+- `mail-thread` / `mail-search-summarize` plus UTC datetime filters
+  on every mail subcommand (PR #25).
+- `gmail-search` / `gmail-read` / `gmail-summarize` / `gmail-draft`
+  for opt-in Gmail integration (PR #26). Default backend is an
+  in-memory fake; the real Gmail backend requires
+  `--credentials-path` to a JSON file with `{"access_token": "..."}`.
+  Read + draft only — never sends. No OAuth browser login, no
+  refresh-token flow, no SMTP / IMAP. See
+  [`docs/usage/gmail.md`](docs/usage/gmail.md).
 
 ## What v0.1 covers
 

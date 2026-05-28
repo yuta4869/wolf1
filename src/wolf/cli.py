@@ -53,6 +53,16 @@ from .mail.search import (
     search_mail,
 )
 from .mail.thread import Thread, ThreadMessage, build_threads
+from .gmail import (
+    FakeGmailClient,
+    GmailClient,
+    GmailClientError,
+    GmailCredentials,
+    GmailDraft,
+    GmailMessage,
+    GmailSearchHit,
+)
+from .gmail.draft import build_reply_draft_raw  # noqa: F401
 from .files.semantic_search import (
     DEFAULT_MAX_HITS as SEMANTIC_DEFAULT_MAX_HITS,
     SemanticHit,
@@ -2767,6 +2777,565 @@ def cmd_mail_search_summarize(args: argparse.Namespace) -> int:
     return _exit_code_for(final)
 
 
+GMAIL_DEFAULT_LIMIT = 10
+GMAIL_DEFAULT_BODY_PREVIEW_BYTES = 500
+
+
+def _build_gmail_client_from_args(
+    args: argparse.Namespace,
+):
+    """Build a Gmail client (real or fake) from CLI args.
+
+    Raises GmailClientError for invalid configuration so the caller
+    can convert it into a CLI exit-2 with a stage label.
+    """
+    backend = getattr(args, "gmail_backend", "fake")
+    if backend == "fake":
+        return FakeGmailClient()
+    if backend == "gmail":
+        creds_path = getattr(args, "credentials_path", None)
+        if not creds_path:
+            raise GmailClientError(
+                "--gmail-backend gmail requires --credentials-path"
+            )
+        path = Path(creds_path)
+        if not path.is_absolute():
+            path = (Path.cwd() / path).resolve()
+        creds = GmailCredentials.from_path(path)
+        base_url = getattr(args, "gmail_base_url", None) or None
+        kwargs = {}
+        if base_url:
+            kwargs["base_url"] = base_url
+            if getattr(args, "allow_non_https_gmail", False):
+                kwargs["allow_non_https"] = True
+        return GmailClient(creds, **kwargs)
+    raise GmailClientError(f"unsupported gmail backend: {backend!r}")
+
+
+def _build_llm_for_gmail(args: argparse.Namespace) -> LLMAdapter:
+    """Mirror of _build_llm_from_args but reads --llm-backend / --model
+    from gmail subcommand args. The model flag is shared (--model)."""
+    backend = getattr(args, "llm_backend", "fake")
+    if backend == "fake":
+        return FakeLLM()
+    if backend == "ollama":
+        from .adapters.ollama import (
+            DEFAULT_BASE_URL as OLLAMA_DEFAULT_URL,
+            OllamaLLMAdapter,
+        )
+
+        model = getattr(args, "model", None)
+        if not model:
+            raise ValueError(
+                "--llm-backend ollama requires --model (e.g. --model llama3.1)"
+            )
+        base_url = getattr(args, "ollama_url", None) or OLLAMA_DEFAULT_URL
+        allow_non_localhost = bool(
+            getattr(args, "allow_non_localhost_ollama", False)
+        )
+        return OllamaLLMAdapter(
+            model=model,
+            base_url=base_url,
+            allow_non_localhost=allow_non_localhost,
+        )
+    raise ValueError(f"unsupported llm backend: {backend!r}")
+
+
+def _gmail_error_decision(label: str, *, stage: str = "gmail") -> Mapping[str, Any]:
+    return {
+        "allowed": False,
+        "executed": False,
+        "requires_confirmation": False,
+        "stage": stage,
+        "reason": label,
+        "provider_called": False,
+        "audit_event_id": None,
+        "failed_checks": [label],
+        "warnings": [],
+    }
+
+
+def _truncate_for_preview(text: str, *, max_bytes: int) -> str:
+    """Return a UTF-8 bounded preview of `text` (best effort)."""
+    if max_bytes <= 0:
+        return ""
+    encoded = text.encode("utf-8", errors="replace")
+    if len(encoded) <= max_bytes:
+        return text
+    cut = encoded[:max_bytes]
+    # Trim a possible split UTF-8 sequence by progressively shrinking.
+    for back in range(0, 4):
+        try:
+            return cut[: len(cut) - back].decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+    return cut.decode("utf-8", errors="replace")
+
+
+def _search_hit_to_dict(h: GmailSearchHit) -> dict:
+    return {"message_id": h.message_id, "thread_id": h.thread_id}
+
+
+def _gmail_message_summary_record(m: GmailMessage) -> dict:
+    """Body-less metadata record used in gmail-search output."""
+    return {
+        "message_id": m.message_id,
+        "thread_id": m.thread_id,
+        "subject": m.subject,
+        "from": m.from_,
+        "date": m.date,
+        "snippet": m.snippet,
+        "has_attachments": m.has_attachments,
+        "attachments_count": len(m.attachments),
+    }
+
+
+def cmd_gmail_search(args: argparse.Namespace) -> int:
+    output_mode = getattr(args, "output", "json")
+    try:
+        client = _build_gmail_client_from_args(args)
+    except GmailClientError as exc:
+        if output_mode == "text":
+            sys.stderr.write(f"wolf cli: gmail config error: {exc.label}\n")
+        else:
+            _print_json(_gmail_error_decision(exc.label, stage="gmail_config"))
+        return EXIT_DENIED
+
+    try:
+        hits = client.search(
+            query=args.query,
+            max_results=int(args.limit),
+        )
+    except GmailClientError as exc:
+        if output_mode == "text":
+            sys.stderr.write(f"wolf cli: {exc.label}\n")
+        else:
+            _print_json(_gmail_error_decision(exc.label, stage="gmail_search"))
+        return EXIT_DENIED
+
+    # If --enrich-headers, read each hit to get subject/from/date/snippet.
+    # Without it, the JSON only carries ids (which mirrors the raw Gmail
+    # list endpoint). Enrichment is on by default because the bare list
+    # is not usable.
+    enrich = not getattr(args, "no_enrich", False)
+    enriched_messages: List[dict] = []
+    skip: List[str] = []
+    if enrich:
+        for h in hits:
+            try:
+                m = client.read(message_id=h.message_id)
+            except GmailClientError as exc:
+                skip.append(
+                    f"gmail-search: skipped {h.message_id} ({exc.label})"
+                )
+                continue
+            enriched_messages.append(_gmail_message_summary_record(m))
+
+    if output_mode == "text":
+        if not hits:
+            sys.stdout.write("(no hits)\n")
+            return EXIT_SUCCESS
+        for rec in enriched_messages if enrich else [_search_hit_to_dict(h) for h in hits]:
+            line_parts = [
+                rec.get("message_id", ""),
+                rec.get("subject", ""),
+                rec.get("from", ""),
+            ]
+            sys.stdout.write("\t".join(line_parts) + "\n")
+        return EXIT_SUCCESS
+
+    payload = {
+        "allowed": True,
+        "executed": True,
+        "requires_confirmation": False,
+        "stage": "complete",
+        "reason": "gmail search complete",
+        "provider_called": True,
+        "audit_event_id": None,
+        "failed_checks": [],
+        "warnings": skip,
+        "result": {
+            "query": args.query,
+            "hit_count": len(hits),
+            "hits": [_search_hit_to_dict(h) for h in hits],
+            "messages": enriched_messages,
+        },
+    }
+    _print_json(payload)
+    return EXIT_SUCCESS
+
+
+def cmd_gmail_read(args: argparse.Namespace) -> int:
+    output_mode = getattr(args, "output", "json")
+    try:
+        client = _build_gmail_client_from_args(args)
+    except GmailClientError as exc:
+        if output_mode == "text":
+            sys.stderr.write(f"wolf cli: gmail config error: {exc.label}\n")
+        else:
+            _print_json(_gmail_error_decision(exc.label, stage="gmail_config"))
+        return EXIT_DENIED
+
+    try:
+        msg = client.read(message_id=args.message_id)
+    except GmailClientError as exc:
+        if output_mode == "text":
+            sys.stderr.write(f"wolf cli: {exc.label}\n")
+        else:
+            _print_json(_gmail_error_decision(exc.label, stage="gmail_read"))
+        return EXIT_DENIED
+
+    preview_bytes = int(getattr(args, "body_preview_bytes", GMAIL_DEFAULT_BODY_PREVIEW_BYTES))
+    preview = _truncate_for_preview(msg.body_text, max_bytes=preview_bytes)
+    truncated = len(msg.body_text.encode("utf-8")) > preview_bytes
+
+    if output_mode == "text":
+        sys.stdout.write(f"Subject: {msg.subject}\n")
+        sys.stdout.write(f"From: {msg.from_}\n")
+        sys.stdout.write(f"Date: {msg.date}\n")
+        sys.stdout.write("\n")
+        sys.stdout.write(preview)
+        if not preview.endswith("\n"):
+            sys.stdout.write("\n")
+        if truncated:
+            sys.stdout.write("[... body truncated ...]\n")
+        return EXIT_SUCCESS
+
+    payload = {
+        "allowed": True,
+        "executed": True,
+        "requires_confirmation": False,
+        "stage": "complete",
+        "reason": "gmail read complete",
+        "provider_called": True,
+        "audit_event_id": None,
+        "failed_checks": [],
+        "warnings": [],
+        "result": {
+            "message_id": msg.message_id,
+            "thread_id": msg.thread_id,
+            "subject": msg.subject,
+            "from": msg.from_,
+            "to": msg.to,
+            "cc": msg.cc,
+            "date": msg.date,
+            "rfc822_message_id": msg.rfc822_message_id,
+            "snippet": msg.snippet,
+            "label_ids": list(msg.label_ids),
+            "has_attachments": msg.has_attachments,
+            "attachments_count": len(msg.attachments),
+            "attachments": [
+                {
+                    "filename": a.filename,
+                    "mime_type": a.mime_type,
+                    "size_bytes": a.size_bytes,
+                }
+                for a in msg.attachments
+            ],
+            "body_preview": preview,
+            "body_preview_bytes": len(preview.encode("utf-8")),
+            "body_total_bytes": len(msg.body_text.encode("utf-8")),
+            "body_truncated": truncated,
+        },
+    }
+    _print_json(payload)
+    return EXIT_SUCCESS
+
+
+def cmd_gmail_summarize(args: argparse.Namespace) -> int:
+    project_root = Path(args.project_root).resolve()
+    output_mode = getattr(args, "output", "json")
+
+    try:
+        client = _build_gmail_client_from_args(args)
+    except GmailClientError as exc:
+        if output_mode == "text":
+            sys.stderr.write(f"wolf cli: gmail config error: {exc.label}\n")
+        else:
+            _print_json(_gmail_error_decision(exc.label, stage="gmail_config"))
+        return EXIT_DENIED
+
+    try:
+        llm = _build_llm_for_gmail(args)
+    except ValueError as exc:
+        sys.stderr.write(f"wolf cli: {exc}\n")
+        return EXIT_DENIED
+
+    # Mail-strict Router (warning markers block).
+    router = _build_router(
+        project_root,
+        llm=llm,
+        config=RouterConfig(allow_warning_injection_findings=False),
+    )
+
+    query = getattr(args, "query", None)
+    message_id = getattr(args, "message_id", None)
+    if not query and not message_id:
+        sys.stderr.write(
+            "wolf cli: gmail-summarize requires --query or --message-id\n"
+        )
+        return EXIT_DENIED
+
+    # Resolve target message ids.
+    target_ids: List[str] = []
+    if message_id:
+        target_ids = [message_id]
+    else:
+        try:
+            hits = client.search(
+                query=query, max_results=int(args.limit)
+            )
+        except GmailClientError as exc:
+            if output_mode == "text":
+                sys.stderr.write(f"wolf cli: {exc.label}\n")
+            else:
+                _print_json(
+                    _gmail_error_decision(exc.label, stage="gmail_search")
+                )
+            return EXIT_DENIED
+        target_ids = [h.message_id for h in hits]
+
+    if not target_ids:
+        if output_mode == "text":
+            sys.stderr.write("wolf cli: no gmail messages match\n")
+        else:
+            _print_json(
+                {
+                    "allowed": False,
+                    "executed": False,
+                    "requires_confirmation": False,
+                    "stage": "gmail_search",
+                    "reason": "no messages",
+                    "provider_called": False,
+                    "audit_event_id": None,
+                    "failed_checks": [],
+                    "warnings": [],
+                }
+            )
+        return EXIT_DENIED
+
+    summaries: List[dict] = []
+    warnings: List[str] = []
+    for mid in target_ids:
+        try:
+            m = client.read(message_id=mid)
+        except GmailClientError as exc:
+            warnings.append(f"gmail-summarize: skipped {mid} ({exc.label})")
+            continue
+        body = wrap_untrusted(
+            m.body_text,
+            SourceKind.EMAIL,
+            source_ref=m.rfc822_message_id or m.message_id,
+            metadata={
+                "subject": m.subject,
+                "from": m.from_,
+                "gmail_message_id": m.message_id,
+            },
+        )
+        decision = router.route(
+            RouterAction(
+                kind=ActionKind.LLM_SUMMARIZE_EMAIL,
+                risk_level=RiskLevel.LOW,
+                body=body,
+            )
+        )
+        if not decision.allowed or not isinstance(decision.result, str):
+            warnings.append(
+                f"gmail-summarize: skipped {m.message_id} "
+                f"(stage={decision.stage})"
+            )
+            continue
+        summaries.append(
+            {
+                "message_id": m.message_id,
+                "thread_id": m.thread_id,
+                "subject": m.subject,
+                "from": m.from_,
+                "date": m.date,
+                "summary": decision.result,
+                "summary_length": len(decision.result),
+            }
+        )
+
+    if output_mode == "text":
+        if not summaries:
+            sys.stderr.write("wolf cli: no summaries produced\n")
+            return EXIT_DENIED
+        for s in summaries:
+            sys.stdout.write(f"# {s['subject']} ({s['from']})\n")
+            sys.stdout.write(s["summary"])
+            if not s["summary"].endswith("\n"):
+                sys.stdout.write("\n")
+            sys.stdout.write("\n")
+        return EXIT_SUCCESS
+
+    _print_json(
+        {
+            "allowed": bool(summaries),
+            "executed": bool(summaries),
+            "requires_confirmation": False,
+            "stage": "complete" if summaries else "complete",
+            "reason": (
+                "gmail summarize complete"
+                if summaries
+                else "no summaries produced"
+            ),
+            "provider_called": True,
+            "audit_event_id": None,
+            "failed_checks": [] if summaries else ["gmail-summarize: all messages skipped"],
+            "warnings": warnings,
+            "result": {
+                "message_count": len(target_ids),
+                "summarized_count": len(summaries),
+                "summaries": summaries,
+            },
+        }
+    )
+    return EXIT_SUCCESS if summaries else EXIT_DENIED
+
+
+def cmd_gmail_draft(args: argparse.Namespace) -> int:
+    project_root = Path(args.project_root).resolve()
+    output_mode = getattr(args, "output", "json")
+    instruction = getattr(args, "instruction", None)
+    if not instruction or not instruction.strip():
+        sys.stderr.write("wolf cli: --instruction is required\n")
+        return EXIT_DENIED
+
+    try:
+        client = _build_gmail_client_from_args(args)
+    except GmailClientError as exc:
+        if output_mode == "text":
+            sys.stderr.write(f"wolf cli: gmail config error: {exc.label}\n")
+        else:
+            _print_json(_gmail_error_decision(exc.label, stage="gmail_config"))
+        return EXIT_DENIED
+
+    try:
+        llm = _build_llm_for_gmail(args)
+    except ValueError as exc:
+        sys.stderr.write(f"wolf cli: {exc}\n")
+        return EXIT_DENIED
+
+    router = _build_router(
+        project_root,
+        llm=llm,
+        config=RouterConfig(allow_warning_injection_findings=False),
+    )
+
+    try:
+        msg = client.read(message_id=args.message_id)
+    except GmailClientError as exc:
+        if output_mode == "text":
+            sys.stderr.write(f"wolf cli: {exc.label}\n")
+        else:
+            _print_json(_gmail_error_decision(exc.label, stage="gmail_read"))
+        return EXIT_DENIED
+
+    # Re-use the local mail draft prompt composer: it builds the same
+    # bilingual instruction-vs-untrusted-body boundary. We synthesize a
+    # minimal ParsedMail-shaped object on the fly because the composer
+    # only consumes .subject / .from_ / .body / .message_id.
+    composer_view = ParsedMail(
+        subject=msg.subject,
+        from_=msg.from_,
+        to=msg.to,
+        cc=msg.cc,
+        date=msg.date,
+        message_id=msg.rfc822_message_id or msg.message_id,
+        body=msg.body_text,
+        has_attachments=msg.has_attachments,
+        content_type="text/plain",
+        byte_size=len(msg.body_text.encode("utf-8")),
+    )
+    parts = build_draft_prompt(composer_view, instruction)
+    composed = parts.composed + parts.mail_body
+    body = wrap_untrusted(
+        composed,
+        SourceKind.EMAIL,
+        source_ref=msg.rfc822_message_id or msg.message_id,
+        metadata={
+            "subject": msg.subject,
+            "from": msg.from_,
+            "gmail_message_id": msg.message_id,
+        },
+    )
+    decision = router.route(
+        RouterAction(
+            kind=ActionKind.LLM_SUMMARIZE_EMAIL,
+            risk_level=RiskLevel.LOW,
+            body=body,
+        )
+    )
+    if not decision.allowed or not isinstance(decision.result, str):
+        return _emit_decision(
+            decision, output_mode=output_mode, include_result=False
+        )
+
+    draft_body = decision.result
+    subject_suggestion = default_subject_for_reply(msg.subject)
+
+    # Create the draft on Gmail (fake or real). Sending is never called.
+    try:
+        draft = client.create_draft(
+            to=msg.from_,
+            source_subject=msg.subject,
+            body=draft_body,
+            in_reply_to=msg.rfc822_message_id,
+            references=msg.rfc822_message_id,
+            thread_id=msg.thread_id,
+        )
+    except GmailClientError as exc:
+        if output_mode == "text":
+            sys.stderr.write(f"wolf cli: {exc.label}\n")
+        else:
+            _print_json(
+                _gmail_error_decision(exc.label, stage="gmail_create_draft")
+            )
+        return EXIT_DENIED
+
+    preview_bytes = int(
+        getattr(args, "body_preview_bytes", GMAIL_DEFAULT_BODY_PREVIEW_BYTES)
+    )
+    body_preview = _truncate_for_preview(draft_body, max_bytes=preview_bytes)
+
+    if output_mode == "text":
+        sys.stdout.write(draft_body)
+        if not draft_body.endswith("\n"):
+            sys.stdout.write("\n")
+        return EXIT_SUCCESS
+
+    _print_json(
+        {
+            "allowed": True,
+            "executed": True,
+            "requires_confirmation": False,
+            "stage": "complete",
+            "reason": "gmail draft created (not sent)",
+            "provider_called": True,
+            "audit_event_id": None,
+            "failed_checks": [],
+            "warnings": list(decision.warnings),
+            "result": {
+                "draft_id": draft.draft_id,
+                "message_id": draft.message_id,
+                "thread_id": draft.thread_id,
+                "source_message_id": msg.message_id,
+                "source_subject": msg.subject,
+                "source_from": msg.from_,
+                "subject_suggestion": subject_suggestion,
+                "body_preview": body_preview,
+                "body_preview_bytes": len(body_preview.encode("utf-8")),
+                "body_total_bytes": len(draft_body.encode("utf-8")),
+                "body_truncated": (
+                    len(draft_body.encode("utf-8")) > preview_bytes
+                ),
+            },
+        }
+    )
+    return EXIT_SUCCESS
+
+
 def cmd_check_path(args: argparse.Namespace) -> int:
     project_root = Path(args.project_root).resolve()
     router = _build_router(project_root)
@@ -3738,6 +4307,169 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output format (default: json)",
     )
     mss.set_defaults(func=cmd_mail_search_summarize)
+
+    # gmail-search
+    gs = sub.add_parser(
+        "gmail-search",
+        help=(
+            "Search Gmail and return message ids + headers. "
+            "Default backend is fake (no network)."
+        ),
+    )
+    gs.add_argument("--query", required=True, help="Gmail search query (`q=`)")
+    gs.add_argument(
+        "--limit",
+        type=int,
+        default=GMAIL_DEFAULT_LIMIT,
+        help="Max results (default: 10)",
+    )
+    gs.add_argument(
+        "--gmail-backend",
+        choices=("fake", "gmail"),
+        default="fake",
+        help="fake (in-memory) or gmail (real API)",
+    )
+    gs.add_argument(
+        "--credentials-path",
+        default=None,
+        help="Path to a JSON file with {access_token: ...} (required for --gmail-backend gmail)",
+    )
+    gs.add_argument(
+        "--gmail-base-url",
+        default=None,
+        help="Override Gmail API base URL (https://gmail.googleapis.com)",
+    )
+    gs.add_argument(
+        "--allow-non-https-gmail",
+        action="store_true",
+        help="Permit a non-https --gmail-base-url for localhost test stubs",
+    )
+    gs.add_argument(
+        "--no-enrich",
+        action="store_true",
+        help="Return raw search hits (ids only) without per-message header lookup",
+    )
+    gs.add_argument(
+        "--output", choices=("json", "text"), default="json",
+        help="Output format (default: json)",
+    )
+    gs.set_defaults(func=cmd_gmail_search)
+
+    # gmail-read
+    gr = sub.add_parser(
+        "gmail-read",
+        help="Read one Gmail message and return metadata + bounded body preview.",
+    )
+    gr.add_argument("--message-id", required=True, help="Gmail message id")
+    gr.add_argument(
+        "--gmail-backend",
+        choices=("fake", "gmail"),
+        default="fake",
+    )
+    gr.add_argument("--credentials-path", default=None)
+    gr.add_argument("--gmail-base-url", default=None)
+    gr.add_argument(
+        "--allow-non-https-gmail",
+        action="store_true",
+    )
+    gr.add_argument(
+        "--body-preview-bytes",
+        type=int,
+        default=GMAIL_DEFAULT_BODY_PREVIEW_BYTES,
+        help="Cap on body_preview output (default: 500 bytes)",
+    )
+    gr.add_argument(
+        "--output", choices=("json", "text"), default="json",
+    )
+    gr.set_defaults(func=cmd_gmail_read)
+
+    # gmail-summarize
+    gsm = sub.add_parser(
+        "gmail-summarize",
+        help=(
+            "Search/read Gmail messages and summarize each via the "
+            "Router pipeline. No send. No store."
+        ),
+    )
+    gsm.add_argument(
+        "--query", default=None,
+        help="Gmail search query (alternative to --message-id)",
+    )
+    gsm.add_argument(
+        "--message-id", default=None,
+        help="Summarize this exact id (alternative to --query)",
+    )
+    gsm.add_argument(
+        "--limit",
+        type=int,
+        default=GMAIL_DEFAULT_LIMIT,
+        help="Max search results to summarize (default: 10)",
+    )
+    gsm.add_argument(
+        "--gmail-backend",
+        choices=("fake", "gmail"),
+        default="fake",
+    )
+    gsm.add_argument("--credentials-path", default=None)
+    gsm.add_argument("--gmail-base-url", default=None)
+    gsm.add_argument("--allow-non-https-gmail", action="store_true")
+    gsm.add_argument(
+        "--llm-backend",
+        choices=("fake", "ollama"),
+        default="fake",
+        help="LLM backend (default: fake)",
+    )
+    gsm.add_argument("--model", default=None, help="Ollama model name")
+    gsm.add_argument("--ollama-url", default=None, help="Ollama server URL")
+    gsm.add_argument(
+        "--allow-non-localhost-ollama",
+        action="store_true",
+        help="Permit a non-localhost --ollama-url",
+    )
+    gsm.add_argument(
+        "--output", choices=("json", "text"), default="json",
+    )
+    gsm.set_defaults(func=cmd_gmail_summarize)
+
+    # gmail-draft
+    gd = sub.add_parser(
+        "gmail-draft",
+        help=(
+            "Generate a reply draft via the LLM and create it as a Gmail "
+            "draft. NEVER sends."
+        ),
+    )
+    gd.add_argument("--message-id", required=True, help="Gmail message id to reply to")
+    gd.add_argument(
+        "--instruction", required=True,
+        help="User instruction for the reply (trusted; mail body is untrusted)",
+    )
+    gd.add_argument(
+        "--gmail-backend",
+        choices=("fake", "gmail"),
+        default="fake",
+    )
+    gd.add_argument("--credentials-path", default=None)
+    gd.add_argument("--gmail-base-url", default=None)
+    gd.add_argument("--allow-non-https-gmail", action="store_true")
+    gd.add_argument(
+        "--llm-backend",
+        choices=("fake", "ollama"),
+        default="fake",
+    )
+    gd.add_argument("--model", default=None)
+    gd.add_argument("--ollama-url", default=None)
+    gd.add_argument("--allow-non-localhost-ollama", action="store_true")
+    gd.add_argument(
+        "--body-preview-bytes",
+        type=int,
+        default=GMAIL_DEFAULT_BODY_PREVIEW_BYTES,
+        help="Cap on body_preview output (default: 500 bytes)",
+    )
+    gd.add_argument(
+        "--output", choices=("json", "text"), default="json",
+    )
+    gd.set_defaults(func=cmd_gmail_draft)
 
     cp = sub.add_parser(
         "check-path",

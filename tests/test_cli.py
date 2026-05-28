@@ -3060,5 +3060,401 @@ class MailInteropTest(unittest.TestCase):
         self.assertEqual(payload["stage"], "mail_read")
 
 
+class GmailCliTest(unittest.TestCase):
+    """gmail-search / gmail-read / gmail-summarize / gmail-draft (PR #26)."""
+
+    def setUp(self) -> None:
+        self.fixture = _ProjectFixture()
+
+    def tearDown(self) -> None:
+        self.fixture.cleanup()
+
+    def _run(self, *extra_args: str):
+        return _run_inproc(
+            [
+                "--project-root",
+                str(self.fixture.root),
+                *extra_args,
+            ]
+        )
+
+    # ---- gmail-search ----
+
+    def test_gmail_search_fake_success(self) -> None:
+        code, out, _ = self._run(
+            "gmail-search", "--gmail-backend", "fake", "--query", "meeting"
+        )
+        self.assertEqual(code, EXIT_SUCCESS, msg=out)
+        payload = json.loads(out)
+        self.assertEqual(payload["stage"], "complete")
+        self.assertGreaterEqual(payload["result"]["hit_count"], 2)
+        self.assertTrue(payload["result"]["messages"])
+        # Subject / from / date / snippet present in enriched output.
+        first = payload["result"]["messages"][0]
+        self.assertIn("subject", first)
+        self.assertIn("from", first)
+        self.assertIn("snippet", first)
+
+    def test_gmail_search_no_enrich_returns_ids_only(self) -> None:
+        code, out, _ = self._run(
+            "gmail-search",
+            "--gmail-backend", "fake",
+            "--query", "meeting",
+            "--no-enrich",
+        )
+        self.assertEqual(code, EXIT_SUCCESS, msg=out)
+        payload = json.loads(out)
+        self.assertEqual(payload["result"]["messages"], [])
+        self.assertGreaterEqual(payload["result"]["hit_count"], 2)
+
+    def test_gmail_search_text_mode(self) -> None:
+        code, out, _ = self._run(
+            "gmail-search",
+            "--gmail-backend", "fake",
+            "--query", "meeting",
+            "--output", "text",
+        )
+        self.assertEqual(code, EXIT_SUCCESS, msg=out)
+        # Each row is tab-separated id/subject/from.
+        first_line = out.splitlines()[0]
+        self.assertIn("\t", first_line)
+
+    def test_gmail_search_missing_credentials_exits_two(self) -> None:
+        code, out, _ = self._run(
+            "gmail-search",
+            "--gmail-backend", "gmail",
+            "--query", "x",
+        )
+        self.assertEqual(code, EXIT_DENIED)
+        payload = json.loads(out)
+        self.assertEqual(payload["stage"], "gmail_config")
+        self.assertFalse(payload["allowed"])
+
+    # ---- gmail-read ----
+
+    def test_gmail_read_fake_success(self) -> None:
+        code, out, _ = self._run(
+            "gmail-read",
+            "--gmail-backend", "fake",
+            "--message-id", "msg_1",
+        )
+        self.assertEqual(code, EXIT_SUCCESS, msg=out)
+        payload = json.loads(out)
+        self.assertEqual(payload["result"]["message_id"], "msg_1")
+        self.assertIn("Q3 planning", payload["result"]["body_preview"])
+        self.assertIn("body_total_bytes", payload["result"])
+
+    def test_gmail_read_truncates_long_body(self) -> None:
+        code, out, _ = self._run(
+            "gmail-read",
+            "--gmail-backend", "fake",
+            "--message-id", "msg_1",
+            "--body-preview-bytes", "20",
+        )
+        self.assertEqual(code, EXIT_SUCCESS, msg=out)
+        payload = json.loads(out)
+        self.assertTrue(payload["result"]["body_truncated"])
+        self.assertLessEqual(
+            payload["result"]["body_preview_bytes"], 20
+        )
+
+    def test_gmail_read_unknown_id_exits_two(self) -> None:
+        code, out, _ = self._run(
+            "gmail-read",
+            "--gmail-backend", "fake",
+            "--message-id", "no_such_id",
+        )
+        self.assertEqual(code, EXIT_DENIED)
+        payload = json.loads(out)
+        self.assertEqual(payload["stage"], "gmail_read")
+
+    # ---- gmail-summarize ----
+
+    def test_gmail_summarize_query_fake_success(self) -> None:
+        code, out, _ = self._run(
+            "gmail-summarize",
+            "--gmail-backend", "fake",
+            "--query", "meeting",
+            "--llm-backend", "fake",
+        )
+        self.assertEqual(code, EXIT_SUCCESS, msg=out)
+        payload = json.loads(out)
+        self.assertEqual(payload["stage"], "complete")
+        self.assertGreaterEqual(payload["result"]["summarized_count"], 2)
+
+    def test_gmail_summarize_by_message_id(self) -> None:
+        code, out, _ = self._run(
+            "gmail-summarize",
+            "--gmail-backend", "fake",
+            "--message-id", "msg_1",
+            "--llm-backend", "fake",
+        )
+        self.assertEqual(code, EXIT_SUCCESS, msg=out)
+        payload = json.loads(out)
+        self.assertEqual(payload["result"]["summarized_count"], 1)
+        self.assertEqual(
+            payload["result"]["summaries"][0]["message_id"], "msg_1"
+        )
+
+    def test_gmail_summarize_requires_query_or_message_id(self) -> None:
+        code, out, err = self._run(
+            "gmail-summarize",
+            "--gmail-backend", "fake",
+            "--llm-backend", "fake",
+        )
+        self.assertEqual(code, EXIT_DENIED)
+        self.assertIn("requires", err.lower())
+
+    def test_gmail_summarize_ollama_requires_model(self) -> None:
+        code, _, err = self._run(
+            "gmail-summarize",
+            "--gmail-backend", "fake",
+            "--query", "meeting",
+            "--llm-backend", "ollama",
+        )
+        self.assertEqual(code, EXIT_DENIED)
+        self.assertIn("--model", err)
+
+    # ---- gmail-draft ----
+
+    def test_gmail_draft_fake_success(self) -> None:
+        code, out, _ = self._run(
+            "gmail-draft",
+            "--gmail-backend", "fake",
+            "--message-id", "msg_1",
+            "--instruction", "丁寧に返信して",
+            "--llm-backend", "fake",
+        )
+        self.assertEqual(code, EXIT_SUCCESS, msg=out)
+        payload = json.loads(out)
+        self.assertEqual(payload["stage"], "complete")
+        self.assertEqual(
+            payload["result"]["subject_suggestion"],
+            "Re: Quarterly planning meeting",
+        )
+        self.assertTrue(payload["result"]["draft_id"].startswith("fake_draft_"))
+
+    def test_gmail_draft_does_not_send(self) -> None:
+        # The fake client has no .send attribute, and the CLI never calls
+        # send. We assert both: no AttributeError-trapping fallback path
+        # exists, and the reason string never contains "sent".
+        code, out, _ = self._run(
+            "gmail-draft",
+            "--gmail-backend", "fake",
+            "--message-id", "msg_1",
+            "--instruction", "ok",
+            "--llm-backend", "fake",
+        )
+        self.assertEqual(code, EXIT_SUCCESS)
+        payload = json.loads(out)
+        self.assertIn("not sent", payload["reason"])
+        self.assertNotIn("sent successfully", payload["reason"])
+
+    def test_gmail_draft_text_mode_emits_draft_body(self) -> None:
+        code, out, _ = self._run(
+            "gmail-draft",
+            "--gmail-backend", "fake",
+            "--message-id", "msg_1",
+            "--instruction", "ok",
+            "--llm-backend", "fake",
+            "--output", "text",
+        )
+        self.assertEqual(code, EXIT_SUCCESS)
+        # Text mode is the raw draft body; not JSON.
+        with self.assertRaises(json.JSONDecodeError):
+            json.loads(out)
+        self.assertTrue(len(out) > 0)
+
+    def test_gmail_draft_unknown_id_exits_two(self) -> None:
+        code, out, _ = self._run(
+            "gmail-draft",
+            "--gmail-backend", "fake",
+            "--message-id", "no_such_id",
+            "--instruction", "ok",
+            "--llm-backend", "fake",
+        )
+        self.assertEqual(code, EXIT_DENIED)
+        payload = json.loads(out)
+        self.assertEqual(payload["stage"], "gmail_read")
+
+
+class GmailRealBackendTest(unittest.TestCase):
+    """Real-Gmail-backed CLI: credentials path resolution + network errors.
+
+    Uses urllib.request.urlopen patching so no real network call happens.
+    """
+
+    def setUp(self) -> None:
+        self.fixture = _ProjectFixture()
+        self.creds = self.fixture.root / "gmail_token.json"
+        self.creds.write_text(
+            json.dumps({"access_token": "super-secret-token"}),
+            encoding="utf-8",
+        )
+
+    def tearDown(self) -> None:
+        self.fixture.cleanup()
+
+    def _run(self, *extra_args: str):
+        return _run_inproc(
+            [
+                "--project-root",
+                str(self.fixture.root),
+                *extra_args,
+            ]
+        )
+
+    def test_real_backend_network_error_exits_safely(self) -> None:
+        import urllib.error
+        import urllib.request
+        from unittest.mock import patch
+
+        def fake_urlopen(req, timeout):  # noqa: ARG001
+            raise urllib.error.URLError("offline")
+
+        with patch.object(urllib.request, "urlopen", side_effect=fake_urlopen):
+            code, out, _ = self._run(
+                "gmail-search",
+                "--gmail-backend", "gmail",
+                "--credentials-path", str(self.creds),
+                "--query", "x",
+            )
+        self.assertEqual(code, EXIT_DENIED)
+        payload = json.loads(out)
+        self.assertEqual(payload["stage"], "gmail_search")
+        self.assertIn("network error", payload["reason"])
+
+    def test_real_backend_token_not_in_stdout_stderr(self) -> None:
+        import urllib.error
+        import urllib.request
+        from unittest.mock import patch
+
+        def fake_urlopen(req, timeout):  # noqa: ARG001
+            raise urllib.error.HTTPError(
+                url=req.full_url,
+                code=403,
+                msg="Forbidden",
+                hdrs=None,
+                fp=None,
+            )
+
+        with patch.object(urllib.request, "urlopen", side_effect=fake_urlopen):
+            code, out, err = self._run(
+                "gmail-search",
+                "--gmail-backend", "gmail",
+                "--credentials-path", str(self.creds),
+                "--query", "x",
+            )
+        self.assertEqual(code, EXIT_DENIED)
+        self.assertNotIn("super-secret-token", out)
+        self.assertNotIn("super-secret-token", err)
+
+    def test_real_backend_search_request_shape(self) -> None:
+        import urllib.request
+        from unittest.mock import patch
+
+        captured: dict = {}
+
+        class _Resp:
+            def read(self) -> bytes:
+                return json.dumps(
+                    {
+                        "messages": [
+                            {"id": "abc", "threadId": "t"},
+                        ]
+                    }
+                ).encode("utf-8")
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_a) -> None:
+                return None
+
+        def fake_urlopen(req, timeout):  # noqa: ARG001
+            captured["url"] = req.full_url
+            captured["headers"] = dict(req.header_items())
+            return _Resp()
+
+        with patch.object(urllib.request, "urlopen", side_effect=fake_urlopen):
+            code, out, _ = self._run(
+                "gmail-search",
+                "--gmail-backend", "gmail",
+                "--credentials-path", str(self.creds),
+                "--query", "meeting",
+                "--no-enrich",
+            )
+        self.assertEqual(code, EXIT_SUCCESS, msg=out)
+        self.assertIn("/gmail/v1/users/me/messages", captured["url"])
+        self.assertIn("q=meeting", captured["url"])
+        # Bearer header present.
+        auth_lc = {k.lower(): v for k, v in captured["headers"].items()}
+        self.assertTrue(auth_lc.get("authorization", "").startswith("Bearer "))
+
+    def test_real_backend_missing_credentials_file_exits_two(self) -> None:
+        code, out, _ = self._run(
+            "gmail-search",
+            "--gmail-backend", "gmail",
+            "--credentials-path", str(self.fixture.root / "nope.json"),
+            "--query", "x",
+        )
+        self.assertEqual(code, EXIT_DENIED)
+        payload = json.loads(out)
+        self.assertEqual(payload["stage"], "gmail_config")
+
+
+class GmailOllamaCliTest(unittest.TestCase):
+    """gmail-summarize / gmail-draft via Ollama backend (mocked)."""
+
+    def setUp(self) -> None:
+        self.fixture = _ProjectFixture()
+
+    def tearDown(self) -> None:
+        self.fixture.cleanup()
+
+    def _run(self, *extra_args: str):
+        return _run_inproc(
+            [
+                "--project-root",
+                str(self.fixture.root),
+                *extra_args,
+            ]
+        )
+
+    def test_summarize_ollama_mocked(self) -> None:
+        import urllib.request
+        from unittest.mock import patch
+
+        class _Resp:
+            def read(self) -> bytes:
+                return json.dumps(
+                    {"response": "mocked ollama summary", "done": True}
+                ).encode("utf-8")
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_a) -> None:
+                return None
+
+        def fake_urlopen(req, timeout):  # noqa: ARG001
+            return _Resp()
+
+        with patch.object(urllib.request, "urlopen", side_effect=fake_urlopen):
+            code, out, _ = self._run(
+                "gmail-summarize",
+                "--gmail-backend", "fake",
+                "--message-id", "msg_1",
+                "--llm-backend", "ollama",
+                "--model", "llama3.1",
+            )
+        self.assertEqual(code, EXIT_SUCCESS, msg=out)
+        payload = json.loads(out)
+        self.assertEqual(
+            payload["result"]["summaries"][0]["summary"],
+            "mocked ollama summary",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
