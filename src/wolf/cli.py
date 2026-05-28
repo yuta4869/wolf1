@@ -2894,7 +2894,9 @@ def _gmail_message_summary_record(m: GmailMessage) -> dict:
 
 
 def cmd_gmail_search(args: argparse.Namespace) -> int:
+    project_root = Path(args.project_root).resolve()
     output_mode = getattr(args, "output", "json")
+    provider = getattr(args, "gmail_backend", "fake")
     try:
         client = _build_gmail_client_from_args(args)
     except GmailClientError as exc:
@@ -2934,6 +2936,31 @@ def cmd_gmail_search(args: argparse.Namespace) -> int:
                 continue
             enriched_messages.append(_gmail_message_summary_record(m))
 
+    # Audit the search (metadata only — query content never recorded).
+    try:
+        _audit_gmail_api_event(
+            project_root=project_root,
+            actor="cli:gmail-search",
+            action_kind="gmail.search",
+            target="gmail:search",
+            outcome="search_complete",
+            decision="allow",
+            detail={
+                "provider": provider,
+                "query_length": len(args.query or ""),
+                "max_results": int(args.limit),
+                "hit_count": len(hits),
+                "enriched_count": len(enriched_messages),
+                "skipped_count": len(skip),
+            },
+        )
+    except OSError as exc:
+        return _emit_audit_fail_closed(
+            output_mode=output_mode,
+            action_kind="gmail.search",
+            exc=exc,
+        )
+
     if output_mode == "text":
         if not hits:
             sys.stdout.write("(no hits)\n")
@@ -2969,7 +2996,9 @@ def cmd_gmail_search(args: argparse.Namespace) -> int:
 
 
 def cmd_gmail_read(args: argparse.Namespace) -> int:
+    project_root = Path(args.project_root).resolve()
     output_mode = getattr(args, "output", "json")
+    provider = getattr(args, "gmail_backend", "fake")
     try:
         client = _build_gmail_client_from_args(args)
     except GmailClientError as exc:
@@ -2987,6 +3016,32 @@ def cmd_gmail_read(args: argparse.Namespace) -> int:
         else:
             _print_json(_gmail_error_decision(exc.label, stage="gmail_read"))
         return EXIT_DENIED
+
+    # Audit the read (metadata only).
+    try:
+        _audit_gmail_api_event(
+            project_root=project_root,
+            actor="cli:gmail-read",
+            action_kind="gmail.read",
+            target=f"gmail:{msg.message_id}",
+            outcome="read_complete",
+            decision="allow",
+            detail={
+                "provider": provider,
+                "message_id": msg.message_id,
+                "thread_id": msg.thread_id,
+                "subject": msg.subject,
+                "has_attachments": msg.has_attachments,
+                "attachments_count": len(msg.attachments),
+                "body_total_bytes": len(msg.body_text.encode("utf-8")),
+            },
+        )
+    except OSError as exc:
+        return _emit_audit_fail_closed(
+            output_mode=output_mode,
+            action_kind="gmail.read",
+            exc=exc,
+        )
 
     preview_bytes = int(getattr(args, "body_preview_bytes", GMAIL_DEFAULT_BODY_PREVIEW_BYTES))
     preview = _truncate_for_preview(msg.body_text, max_bytes=preview_bytes)
@@ -3448,6 +3503,67 @@ def _audit_gmail_draft_event(
     audit.log(event)
 
 
+def _audit_gmail_api_event(
+    *,
+    project_root: Path,
+    actor: str,
+    action_kind: str,
+    target: str,
+    outcome: str,
+    decision: str,
+    detail: Mapping[str, Any],
+) -> None:
+    """Write one AuditEvent for a non-draft Gmail API call.
+
+    NEVER includes raw mail bodies, query *content*, or the access
+    token. Callers should pass only metadata (counts, lengths,
+    ids, backend name, stage). AuditLogger._mask() additionally
+    redacts any key matching the token / credential / secret /
+    auth family.
+    """
+    from .core.audit import utc_now_iso
+    from .core.types import AuditEvent
+
+    audit = AuditLogger(_default_audit_path(project_root.resolve()))
+    event = AuditEvent(
+        ts=utc_now_iso(),
+        actor=actor,
+        action_kind=action_kind,
+        decision=decision,
+        target=target,
+        outcome=outcome,
+        detail=dict(detail),
+    )
+    audit.log(event)
+
+
+def _emit_audit_fail_closed(
+    *,
+    output_mode: str,
+    action_kind: str,
+    exc: BaseException,
+) -> int:
+    """Render the fail-closed JSON for a gmail-* audit OSError."""
+    label = f"audit_log failed: {action_kind} ({type(exc).__name__})"
+    if output_mode == "text":
+        sys.stderr.write(f"wolf cli: {label}\n")
+    else:
+        _print_json(
+            {
+                "allowed": False,
+                "executed": False,
+                "requires_confirmation": False,
+                "stage": "audit_log",
+                "reason": label,
+                "provider_called": True,
+                "audit_event_id": None,
+                "failed_checks": [label],
+                "warnings": [],
+            }
+        )
+    return EXIT_DENIED
+
+
 def _gmail_thread_to_dict(t: GmailThread) -> dict:
     return {
         "thread_id": t.thread_id,
@@ -3507,7 +3623,9 @@ def _read_gmail_messages(
 
 
 def cmd_gmail_thread(args: argparse.Namespace) -> int:
+    project_root = Path(args.project_root).resolve()
     output_mode = getattr(args, "output", "json")
+    provider = getattr(args, "gmail_backend", "fake")
     try:
         client = _build_gmail_client_from_args(args)
     except GmailClientError as exc:
@@ -3517,22 +3635,49 @@ def cmd_gmail_thread(args: argparse.Namespace) -> int:
             _print_json(_gmail_error_decision(exc.label, stage="gmail_config"))
         return EXIT_DENIED
 
-    if not getattr(args, "query", None) and not getattr(args, "message_id", None):
+    thread_id = getattr(args, "thread_id", None)
+    query = getattr(args, "query", None)
+    message_id = getattr(args, "message_id", None)
+    inputs_set = sum(1 for v in (thread_id, query, message_id) if v)
+    if inputs_set == 0:
         sys.stderr.write(
-            "wolf cli: gmail-thread requires --query or --message-id\n"
+            "wolf cli: gmail-thread requires --query, --message-id, or --thread-id\n"
+        )
+        return EXIT_DENIED
+    if inputs_set > 1:
+        sys.stderr.write(
+            "wolf cli: gmail-thread accepts only one of "
+            "--query / --message-id / --thread-id\n"
         )
         return EXIT_DENIED
 
-    try:
-        ids, _ = _resolve_gmail_targets(client=client, args=args)
-    except GmailClientError as exc:
-        if output_mode == "text":
-            sys.stderr.write(f"wolf cli: {exc.label}\n")
-        else:
-            _print_json(_gmail_error_decision(exc.label, stage="gmail_search"))
-        return EXIT_DENIED
+    # Direct thread-id path: skip search/read and go straight to
+    # client.get_thread.
+    if thread_id:
+        try:
+            members = client.get_thread(thread_id=thread_id)
+        except GmailClientError as exc:
+            if output_mode == "text":
+                sys.stderr.write(f"wolf cli: {exc.label}\n")
+            else:
+                _print_json(
+                    _gmail_error_decision(exc.label, stage="gmail_get_thread")
+                )
+            return EXIT_DENIED
+        messages = list(members)
+        skip: List[str] = []
+    else:
+        try:
+            ids, _ = _resolve_gmail_targets(client=client, args=args)
+        except GmailClientError as exc:
+            if output_mode == "text":
+                sys.stderr.write(f"wolf cli: {exc.label}\n")
+            else:
+                _print_json(_gmail_error_decision(exc.label, stage="gmail_search"))
+            return EXIT_DENIED
 
-    messages, skip = _read_gmail_messages(client=client, ids=ids)
+        messages, skip = _read_gmail_messages(client=client, ids=ids)
+
     if not messages:
         if output_mode == "text":
             sys.stderr.write("wolf cli: no gmail messages found\n")
@@ -3572,6 +3717,40 @@ def cmd_gmail_thread(args: argparse.Namespace) -> int:
             )
         return EXIT_DENIED
 
+    if thread_id:
+        input_mode = "thread_id"
+    elif message_id:
+        input_mode = "message_id"
+    else:
+        input_mode = "query"
+
+    try:
+        _audit_gmail_api_event(
+            project_root=project_root,
+            actor="cli:gmail-thread",
+            action_kind="gmail.thread",
+            target=(
+                f"gmail-thread:{thread_id}"
+                if thread_id else "gmail-thread:search"
+            ),
+            outcome="thread_complete",
+            decision="allow",
+            detail={
+                "provider": provider,
+                "input_mode": input_mode,
+                "query_length": len(query or ""),
+                "message_count": len(messages),
+                "thread_count": len(threads),
+                "skipped_count": len(skip),
+            },
+        )
+    except OSError as exc:
+        return _emit_audit_fail_closed(
+            output_mode=output_mode,
+            action_kind="gmail.thread",
+            exc=exc,
+        )
+
     if output_mode == "text":
         for t in threads:
             sys.stdout.write(
@@ -3604,6 +3783,8 @@ def cmd_gmail_thread(args: argparse.Namespace) -> int:
 def cmd_gmail_search_summarize(args: argparse.Namespace) -> int:
     project_root = Path(args.project_root).resolve()
     output_mode = getattr(args, "output", "json")
+    provider = getattr(args, "gmail_backend", "fake")
+    llm_backend = getattr(args, "llm_backend", "fake")
 
     try:
         client = _build_gmail_client_from_args(args)
@@ -3620,11 +3801,29 @@ def cmd_gmail_search_summarize(args: argparse.Namespace) -> int:
         sys.stderr.write(f"wolf cli: {exc}\n")
         return EXIT_DENIED
 
-    if not getattr(args, "query", None) and not getattr(args, "message_id", None):
+    thread_id = getattr(args, "thread_id", None)
+    query = getattr(args, "query", None)
+    message_id = getattr(args, "message_id", None)
+    inputs_set = sum(1 for v in (thread_id, query, message_id) if v)
+    if inputs_set == 0:
         sys.stderr.write(
-            "wolf cli: gmail-search-summarize requires --query or --message-id\n"
+            "wolf cli: gmail-search-summarize requires "
+            "--query, --message-id, or --thread-id\n"
         )
         return EXIT_DENIED
+    if inputs_set > 1:
+        sys.stderr.write(
+            "wolf cli: gmail-search-summarize accepts only one of "
+            "--query / --message-id / --thread-id\n"
+        )
+        return EXIT_DENIED
+
+    if thread_id:
+        input_mode = "thread_id"
+    elif message_id:
+        input_mode = "message_id"
+    else:
+        input_mode = "query"
 
     # Mail-strict Router (warning markers block) for per-message summary.
     router = _build_router(
@@ -3633,16 +3832,33 @@ def cmd_gmail_search_summarize(args: argparse.Namespace) -> int:
         config=RouterConfig(allow_warning_injection_findings=False),
     )
 
-    try:
-        ids, _ = _resolve_gmail_targets(client=client, args=args)
-    except GmailClientError as exc:
-        if output_mode == "text":
-            sys.stderr.write(f"wolf cli: {exc.label}\n")
-        else:
-            _print_json(_gmail_error_decision(exc.label, stage="gmail_search"))
-        return EXIT_DENIED
+    # Resolve targets. The --thread-id path skips search entirely.
+    if thread_id:
+        try:
+            members = client.get_thread(thread_id=thread_id)
+        except GmailClientError as exc:
+            if output_mode == "text":
+                sys.stderr.write(f"wolf cli: {exc.label}\n")
+            else:
+                _print_json(
+                    _gmail_error_decision(exc.label, stage="gmail_get_thread")
+                )
+            return EXIT_DENIED
+        messages = list(members)
+        skip: List[str] = []
+        searched_count = 0
+    else:
+        try:
+            ids, _ = _resolve_gmail_targets(client=client, args=args)
+        except GmailClientError as exc:
+            if output_mode == "text":
+                sys.stderr.write(f"wolf cli: {exc.label}\n")
+            else:
+                _print_json(_gmail_error_decision(exc.label, stage="gmail_search"))
+            return EXIT_DENIED
+        searched_count = len(ids)
+        messages, skip = _read_gmail_messages(client=client, ids=ids)
 
-    messages, skip = _read_gmail_messages(client=client, ids=ids)
     if not messages:
         if output_mode == "text":
             sys.stderr.write("wolf cli: no gmail messages found\n")
@@ -3662,7 +3878,7 @@ def cmd_gmail_search_summarize(args: argparse.Namespace) -> int:
             )
         return EXIT_DENIED
 
-    threaded = bool(getattr(args, "threaded", False))
+    threaded = bool(getattr(args, "threaded", False)) or bool(thread_id)
     include_per_msg = bool(getattr(args, "include_per_message_summary", False))
     include_per_thread = bool(getattr(args, "include_per_thread_summary", False))
 
@@ -3820,6 +4036,45 @@ def cmd_gmail_search_summarize(args: argparse.Namespace) -> int:
                 f"gmail-search-summarize: aggregate skipped (stage={decision.stage})"
             )
 
+    # Audit the search-summarize stage (metadata only).
+    try:
+        _audit_gmail_api_event(
+            project_root=project_root,
+            actor="cli:gmail-search-summarize",
+            action_kind="gmail.search_summarize",
+            target=(
+                f"gmail-thread:{thread_id}"
+                if thread_id
+                else "gmail-search-summarize"
+            ),
+            outcome=(
+                "summarize_complete"
+                if summarized_count > 0
+                else "summarize_empty"
+            ),
+            decision="allow" if summarized_count > 0 else "deny",
+            detail={
+                "provider": provider,
+                "llm_backend": llm_backend,
+                "input_mode": input_mode,
+                "query_length": len(query or ""),
+                "searched_count": searched_count,
+                "read_count": len(messages),
+                "summarized_count": summarized_count,
+                "threaded": bool(threaded),
+                "thread_count": (
+                    len(thread_summaries) if threaded else 0
+                ),
+                "aggregate_summary_length": len(aggregate_summary or ""),
+            },
+        )
+    except OSError as exc:
+        return _emit_audit_fail_closed(
+            output_mode=output_mode,
+            action_kind="gmail.search_summarize",
+            exc=exc,
+        )
+
     if output_mode == "text":
         if aggregate_summary:
             sys.stdout.write(aggregate_summary)
@@ -3830,12 +4085,24 @@ def cmd_gmail_search_summarize(args: argparse.Namespace) -> int:
             return EXIT_DENIED
         return EXIT_SUCCESS
 
+    trace = {
+        "input_mode": input_mode,
+        "gmail_backend": provider,
+        "llm_backend": llm_backend,
+        "searched_count": searched_count,
+        "read_count": len(messages),
+        "summarized_count": summarized_count,
+        "audit_event_count": 1,
+    }
+
     result: Dict[str, Any] = {
         "mode": "threaded" if threaded else "message",
         "query": getattr(args, "query", None),
+        "thread_id": thread_id,
         "message_count": len(messages),
         "summarized_count": summarized_count,
         "messages": per_message_summaries,
+        "trace": trace,
     }
     if threaded:
         result["threads"] = thread_summaries
@@ -5013,6 +5280,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Read only this exact message and try to thread it",
     )
     gt.add_argument(
+        "--thread-id", default=None,
+        help=(
+            "Fetch the messages of this Gmail thread directly "
+            "(GET /threads/{id}). Mutually exclusive with --query / "
+            "--message-id."
+        ),
+    )
+    gt.add_argument(
         "--limit",
         type=int,
         default=GMAIL_DEFAULT_LIMIT,
@@ -5045,6 +5320,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     gss.add_argument("--query", default=None)
     gss.add_argument("--message-id", default=None)
+    gss.add_argument(
+        "--thread-id", default=None,
+        help=(
+            "Summarize one Gmail thread directly (GET /threads/{id}). "
+            "Mutually exclusive with --query / --message-id. With "
+            "--thread-id the command implicitly enters threaded mode."
+        ),
+    )
     gss.add_argument(
         "--limit",
         type=int,

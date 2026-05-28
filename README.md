@@ -18,11 +18,16 @@ shipped after PR #1 through PR #21.
 - `gmail-search` / `gmail-read` / `gmail-summarize` / `gmail-draft`
   for opt-in Gmail integration (PR #26), plus `gmail-thread` /
   `gmail-search-summarize` (PR #27) and AuditLogger entries for
-  every `gmail-draft create_draft` call. Default backend is an
-  in-memory fake; the real Gmail backend requires
-  `--credentials-path` to a JSON file with `{"access_token": "..."}`.
-  Read + draft only — never sends. No OAuth browser login, no
-  refresh-token flow, no SMTP / IMAP. See
+  every `gmail-draft create_draft` call. PR #28 extends audit
+  coverage to all Gmail API calls (`gmail.search`,
+  `gmail.read`, `gmail.thread`, `gmail.search_summarize`),
+  adds `--thread-id` direct fetch to `gmail-thread` and
+  `gmail-search-summarize`, and adds a `result.trace` block
+  with per-stage counts. Default backend is an in-memory fake;
+  the real Gmail backend requires `--credentials-path` to a
+  JSON file with `{"access_token": "..."}`. Read + draft only
+  — never sends. No OAuth browser login, no refresh-token flow,
+  no SMTP / IMAP. See
   [`docs/usage/gmail.md`](docs/usage/gmail.md) and
   [`docs/setup/gmail.md`](docs/setup/gmail.md).
 

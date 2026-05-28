@@ -161,5 +161,18 @@ class EmptyAndEdgeCasesTest(unittest.TestCase):
         self.assertEqual([t.thread_id for t in ts], ["t-early", "t-late"])
 
 
+class DirectThreadIdGroupingTest(unittest.TestCase):
+    """PR #28: when all input messages share a thread_id (e.g. the
+    output of get_thread), build_threads must collapse them into one."""
+
+    def test_get_thread_output_collapses_to_one_thread(self) -> None:
+        c = FakeGmailClient()
+        members = c.get_thread(thread_id="thread_1")
+        ts = build_threads(list(members))
+        self.assertEqual(len(ts), 1)
+        self.assertEqual(ts[0].thread_id, "thread_1")
+        self.assertEqual(ts[0].message_count, 2)
+
+
 if __name__ == "__main__":
     unittest.main()

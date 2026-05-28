@@ -117,6 +117,7 @@ class FakeGmailClient:
     raise_on_search: Optional[GmailClientError] = None
     raise_on_read: Optional[GmailClientError] = None
     raise_on_create_draft: Optional[GmailClientError] = None
+    raise_on_get_thread: Optional[GmailClientError] = None
 
     def set_messages(self, messages: List[GmailMessage]) -> None:
         self.messages = list(messages)
@@ -156,6 +157,18 @@ class FakeGmailClient:
             if m.message_id == message_id:
                 return m
         raise GmailClientError(f"gmail:read: message id not found")
+
+    def get_thread(self, *, thread_id: str) -> Tuple[GmailMessage, ...]:
+        if self.raise_on_get_thread is not None:
+            raise self.raise_on_get_thread
+        if not isinstance(thread_id, str) or not thread_id.strip():
+            raise GmailClientError("thread_id must be a non-empty string")
+        members = tuple(
+            m for m in self.messages if m.thread_id == thread_id
+        )
+        if not members:
+            raise GmailClientError("gmail:get_thread: thread id not found")
+        return members
 
     def create_draft(
         self,

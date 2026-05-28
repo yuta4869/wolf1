@@ -3839,5 +3839,309 @@ class GmailOllamaCliTest(unittest.TestCase):
         )
 
 
+class GmailApiAuditTest(unittest.TestCase):
+    """PR #28: every gmail-* command writes an AuditEvent for its API call.
+
+    None of the audit events contain raw mail body or token bytes.
+    """
+
+    def setUp(self) -> None:
+        self.fixture = _ProjectFixture()
+
+    def tearDown(self) -> None:
+        self.fixture.cleanup()
+
+    def _audit_path(self):
+        return self.fixture.root / "var" / "audit" / "audit.jsonl"
+
+    def _audit_lines(self):
+        p = self._audit_path()
+        if not p.exists():
+            return []
+        with p.open("r", encoding="utf-8") as f:
+            return [json.loads(line) for line in f if line.strip()]
+
+    def _run(self, *extra_args: str):
+        return _run_inproc(
+            [
+                "--project-root",
+                str(self.fixture.root),
+                *extra_args,
+            ]
+        )
+
+    def test_gmail_search_writes_audit(self) -> None:
+        code, _out, _ = self._run(
+            "gmail-search", "--gmail-backend", "fake",
+            "--query", "meeting",
+        )
+        self.assertEqual(code, EXIT_SUCCESS)
+        events = self._audit_lines()
+        kinds = [e["action_kind"] for e in events]
+        self.assertIn("gmail.search", kinds)
+        ev = [e for e in events if e["action_kind"] == "gmail.search"][-1]
+        self.assertEqual(ev["actor"], "cli:gmail-search")
+        self.assertEqual(ev["decision"], "allow")
+        d = ev["detail"]
+        self.assertEqual(d["provider"], "fake")
+        self.assertIn("query_length", d)
+        self.assertIn("hit_count", d)
+        # Body and token never appear.
+        text = self._audit_path().read_text(encoding="utf-8")
+        self.assertNotIn("Kicking off Q3 planning", text)
+        self.assertNotIn("Bearer ", text)
+
+    def test_gmail_read_writes_audit(self) -> None:
+        code, _out, _ = self._run(
+            "gmail-read", "--gmail-backend", "fake",
+            "--message-id", "msg_1",
+        )
+        self.assertEqual(code, EXIT_SUCCESS)
+        events = self._audit_lines()
+        kinds = [e["action_kind"] for e in events]
+        self.assertIn("gmail.read", kinds)
+        ev = [e for e in events if e["action_kind"] == "gmail.read"][-1]
+        self.assertEqual(ev["actor"], "cli:gmail-read")
+        self.assertEqual(ev["detail"]["message_id"], "msg_1")
+        self.assertIn("body_total_bytes", ev["detail"])
+        # No body text leak.
+        text = self._audit_path().read_text(encoding="utf-8")
+        self.assertNotIn("Kicking off Q3 planning", text)
+
+    def test_gmail_thread_writes_audit(self) -> None:
+        code, _out, _ = self._run(
+            "gmail-thread", "--gmail-backend", "fake",
+            "--query", "meeting",
+        )
+        self.assertEqual(code, EXIT_SUCCESS)
+        events = self._audit_lines()
+        kinds = [e["action_kind"] for e in events]
+        self.assertIn("gmail.thread", kinds)
+        ev = [e for e in events if e["action_kind"] == "gmail.thread"][-1]
+        self.assertEqual(ev["actor"], "cli:gmail-thread")
+        self.assertEqual(ev["detail"]["input_mode"], "query")
+        self.assertGreater(ev["detail"]["thread_count"], 0)
+
+    def test_gmail_search_summarize_writes_audit(self) -> None:
+        code, _out, _ = self._run(
+            "gmail-search-summarize",
+            "--gmail-backend", "fake",
+            "--query", "meeting",
+            "--llm-backend", "fake",
+        )
+        self.assertEqual(code, EXIT_SUCCESS)
+        events = self._audit_lines()
+        kinds = [e["action_kind"] for e in events]
+        self.assertIn("gmail.search_summarize", kinds)
+        ev = [
+            e for e in events
+            if e["action_kind"] == "gmail.search_summarize"
+        ][-1]
+        self.assertEqual(ev["detail"]["input_mode"], "query")
+        self.assertEqual(ev["detail"]["llm_backend"], "fake")
+
+    def test_audit_failure_in_search_returns_audit_log_stage(self) -> None:
+        from unittest.mock import patch
+
+        with patch(
+            "wolf.cli._audit_gmail_api_event",
+            side_effect=OSError("disk full"),
+        ):
+            code, out, _ = self._run(
+                "gmail-search", "--gmail-backend", "fake",
+                "--query", "meeting",
+            )
+        self.assertEqual(code, EXIT_DENIED)
+        payload = json.loads(out)
+        self.assertEqual(payload["stage"], "audit_log")
+
+    def test_audit_failure_in_thread_returns_audit_log_stage(self) -> None:
+        from unittest.mock import patch
+
+        with patch(
+            "wolf.cli._audit_gmail_api_event",
+            side_effect=OSError("disk full"),
+        ):
+            code, out, _ = self._run(
+                "gmail-thread", "--gmail-backend", "fake",
+                "--query", "meeting",
+            )
+        self.assertEqual(code, EXIT_DENIED)
+        payload = json.loads(out)
+        self.assertEqual(payload["stage"], "audit_log")
+
+
+class GmailThreadDirectIdTest(unittest.TestCase):
+    """PR #28: gmail-thread --thread-id and conflict handling."""
+
+    def setUp(self) -> None:
+        self.fixture = _ProjectFixture()
+
+    def tearDown(self) -> None:
+        self.fixture.cleanup()
+
+    def _run(self, *extra_args: str):
+        return _run_inproc(
+            [
+                "--project-root",
+                str(self.fixture.root),
+                *extra_args,
+            ]
+        )
+
+    def test_direct_thread_id_success(self) -> None:
+        code, out, _ = self._run(
+            "gmail-thread", "--gmail-backend", "fake",
+            "--thread-id", "thread_1",
+        )
+        self.assertEqual(code, EXIT_SUCCESS, msg=out)
+        payload = json.loads(out)
+        self.assertEqual(payload["result"]["thread_count"], 1)
+        self.assertEqual(payload["result"]["message_count"], 2)
+        self.assertEqual(
+            payload["result"]["threads"][0]["thread_id"], "thread_1"
+        )
+
+    def test_unknown_thread_id_exits_two(self) -> None:
+        code, out, _ = self._run(
+            "gmail-thread", "--gmail-backend", "fake",
+            "--thread-id", "no_such_thread",
+        )
+        self.assertEqual(code, EXIT_DENIED)
+        payload = json.loads(out)
+        self.assertEqual(payload["stage"], "gmail_get_thread")
+
+    def test_conflict_thread_id_and_query_exits_two(self) -> None:
+        code, _out, err = self._run(
+            "gmail-thread", "--gmail-backend", "fake",
+            "--thread-id", "thread_1",
+            "--query", "meeting",
+        )
+        self.assertEqual(code, EXIT_DENIED)
+        self.assertIn("only one", err)
+
+    def test_conflict_thread_id_and_message_id_exits_two(self) -> None:
+        code, _out, err = self._run(
+            "gmail-thread", "--gmail-backend", "fake",
+            "--thread-id", "thread_1",
+            "--message-id", "msg_1",
+        )
+        self.assertEqual(code, EXIT_DENIED)
+        self.assertIn("only one", err)
+
+
+class GmailSearchSummarizeThreadIdAndTraceTest(unittest.TestCase):
+    """PR #28: gmail-search-summarize --thread-id + result.trace."""
+
+    def setUp(self) -> None:
+        self.fixture = _ProjectFixture()
+
+    def tearDown(self) -> None:
+        self.fixture.cleanup()
+
+    def _run(self, *extra_args: str):
+        return _run_inproc(
+            [
+                "--project-root",
+                str(self.fixture.root),
+                *extra_args,
+            ]
+        )
+
+    def test_thread_id_aggregate_summary(self) -> None:
+        code, out, _ = self._run(
+            "gmail-search-summarize",
+            "--gmail-backend", "fake",
+            "--thread-id", "thread_1",
+            "--llm-backend", "fake",
+        )
+        self.assertEqual(code, EXIT_SUCCESS, msg=out)
+        payload = json.loads(out)
+        self.assertEqual(payload["result"]["mode"], "threaded")
+        self.assertIn("summary", payload["result"])
+        self.assertEqual(payload["result"]["thread_id"], "thread_1")
+
+    def test_thread_id_with_include_per_thread_summary(self) -> None:
+        code, out, _ = self._run(
+            "gmail-search-summarize",
+            "--gmail-backend", "fake",
+            "--thread-id", "thread_1",
+            "--include-per-thread-summary",
+            "--llm-backend", "fake",
+        )
+        self.assertEqual(code, EXIT_SUCCESS, msg=out)
+        payload = json.loads(out)
+        for tr in payload["result"]["threads"]:
+            self.assertIn("summary", tr)
+
+    def test_trace_thread_id_mode(self) -> None:
+        code, out, _ = self._run(
+            "gmail-search-summarize",
+            "--gmail-backend", "fake",
+            "--thread-id", "thread_1",
+            "--llm-backend", "fake",
+        )
+        self.assertEqual(code, EXIT_SUCCESS, msg=out)
+        payload = json.loads(out)
+        trace = payload["result"]["trace"]
+        self.assertEqual(trace["input_mode"], "thread_id")
+        self.assertEqual(trace["gmail_backend"], "fake")
+        self.assertEqual(trace["llm_backend"], "fake")
+        self.assertEqual(trace["searched_count"], 0)
+        self.assertEqual(trace["read_count"], 2)
+        self.assertGreaterEqual(trace["summarized_count"], 1)
+
+    def test_trace_query_mode(self) -> None:
+        code, out, _ = self._run(
+            "gmail-search-summarize",
+            "--gmail-backend", "fake",
+            "--query", "meeting",
+            "--llm-backend", "fake",
+        )
+        self.assertEqual(code, EXIT_SUCCESS, msg=out)
+        payload = json.loads(out)
+        trace = payload["result"]["trace"]
+        self.assertEqual(trace["input_mode"], "query")
+        self.assertGreaterEqual(trace["searched_count"], 2)
+
+    def test_conflicting_inputs_exit_two(self) -> None:
+        code, _out, err = self._run(
+            "gmail-search-summarize",
+            "--gmail-backend", "fake",
+            "--thread-id", "thread_1",
+            "--query", "meeting",
+            "--llm-backend", "fake",
+        )
+        self.assertEqual(code, EXIT_DENIED)
+        self.assertIn("only one", err)
+
+    def test_unknown_thread_id_exits_two(self) -> None:
+        code, out, _ = self._run(
+            "gmail-search-summarize",
+            "--gmail-backend", "fake",
+            "--thread-id", "no_such_thread",
+            "--llm-backend", "fake",
+        )
+        self.assertEqual(code, EXIT_DENIED)
+        payload = json.loads(out)
+        self.assertEqual(payload["stage"], "gmail_get_thread")
+
+    def test_raw_body_not_in_stdout(self) -> None:
+        code, out, _ = self._run(
+            "gmail-search-summarize",
+            "--gmail-backend", "fake",
+            "--thread-id", "thread_1",
+            "--llm-backend", "fake",
+        )
+        self.assertEqual(code, EXIT_SUCCESS)
+        payload = json.loads(out)
+        for rec in payload["result"]["messages"]:
+            self.assertNotIn("body", rec)
+            self.assertNotIn("body_text", rec)
+        for tr in payload["result"].get("threads", []):
+            self.assertNotIn("body", tr)
+            self.assertNotIn("body_text", tr)
+
+
 if __name__ == "__main__":
     unittest.main()

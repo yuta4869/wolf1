@@ -117,6 +117,33 @@ class FakeCreateDraftTest(unittest.TestCase):
             )
 
 
+class FakeGetThreadTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.client = FakeGmailClient()
+
+    def test_get_thread_returns_members(self) -> None:
+        members = self.client.get_thread(thread_id="thread_1")
+        self.assertEqual(len(members), 2)
+        ids = [m.message_id for m in members]
+        self.assertIn("msg_1", ids)
+        self.assertIn("msg_2", ids)
+
+    def test_get_thread_unknown_id_raises(self) -> None:
+        with self.assertRaises(GmailClientError):
+            self.client.get_thread(thread_id="no_such_thread")
+
+    def test_get_thread_empty_id_raises(self) -> None:
+        with self.assertRaises(GmailClientError):
+            self.client.get_thread(thread_id="")
+
+    def test_raise_on_get_thread_propagates(self) -> None:
+        c = FakeGmailClient(
+            raise_on_get_thread=GmailClientError("forced"),
+        )
+        with self.assertRaises(GmailClientError):
+            c.get_thread(thread_id="thread_1")
+
+
 class FakeHasNoSendTest(unittest.TestCase):
     def test_fake_does_not_expose_send_method(self) -> None:
         c = FakeGmailClient()

@@ -133,15 +133,20 @@ out of scope for this PR.
 
 - Tokens expire. The expected failure mode is
   `gmail:*: HTTP 401`. Re-issue the token and retry.
-- Every `gmail-draft` call writes one event to
-  `var/audit/audit.jsonl` with `action_kind=gmail.create_draft`.
-  The event contains the draft id, source message id, subject
-  suggestion, and `draft_body_length` — never the draft body
-  text, never the source body, never the access token. Failed
-  attempts are also recorded with `outcome=draft_failed`.
+- **PR #28 broadens audit coverage.** Every `gmail-*` command
+  writes one event to `var/audit/audit.jsonl`:
+  `gmail.search`, `gmail.read`, `gmail.thread`,
+  `gmail.search_summarize`, `gmail.create_draft`. Each event
+  carries only metadata (provider, counts, ids, lengths). The
+  access token, raw mail body, draft body, and the search
+  query string itself are NEVER recorded.
 - `AuditLogger._mask()` additionally redacts any key matching
   `token` / `credential` / `secret` / `auth` etc., so an
   accidental field would be redacted on write.
+- If the audit write fails (disk full, permission), the CLI
+  returns `stage=audit_log` with exit 2 and refuses to claim
+  success. For `gmail-draft` this can happen *after* a draft
+  has already been created on Gmail's side; reconcile by hand.
 
 ## What still works without the real backend
 
