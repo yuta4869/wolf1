@@ -31,13 +31,23 @@ backend is opt-in via `--gmail-backend gmail --credentials-path
   the event records the draft id, source message id, subject
   suggestion, and `draft_body_length` — never the body text,
   never the access token (PR #27).
-- `gmail-thread` (PR #27) — read messages and group them by
-  Gmail's `threadId`. When `threadId` is missing or empty, fall
-  back to the same lineage + normalized-subject strategy used by
-  `mail-thread`. Output is body-less metadata.
-- `gmail-search-summarize` (PR #27) — search → read → per-message
-  summary (default) or `--threaded` per-thread summary, then a
-  Router-mediated aggregate.
+- `gmail-thread` (PR #27, extended PR #28) — read messages and
+  group them by Gmail's `threadId`, with a normalized-subject
+  fallback. PR #28 adds `--thread-id` for direct fetch via
+  `GET /threads/{id}?format=full`.
+- `gmail-search-summarize` (PR #27, extended PR #28) — search →
+  read → per-message (default) or per-thread (`--threaded`)
+  summary, then a Router-mediated aggregate. PR #28 adds
+  `--thread-id` (implies threaded mode) and a `result.trace`
+  block with `input_mode` / `gmail_backend` / `llm_backend` /
+  per-stage counts.
+- **Audit coverage (PR #28)** — every `gmail-*` command writes
+  one `AuditEvent` to `var/audit/audit.jsonl` with
+  `action_kind` ∈ {`gmail.search`, `gmail.read`,
+  `gmail.thread`, `gmail.search_summarize`,
+  `gmail.create_draft`}. Details are metadata only (provider,
+  query length, counts, ids); the access token, raw mail body,
+  and the search query *content* are never recorded.
 
 ## Backends
 
@@ -121,6 +131,15 @@ PYTHONPATH=src python3 -m wolf.cli gmail-search-summarize \
 # Search → per-thread summary → aggregate.
 PYTHONPATH=src python3 -m wolf.cli gmail-search-summarize \
     --gmail-backend fake --query "meeting" --threaded \
+    --llm-backend fake --output text
+
+# Direct thread-id fetch (PR #28) — skip search entirely.
+PYTHONPATH=src python3 -m wolf.cli gmail-thread \
+    --gmail-backend fake --thread-id thread_1 --output text
+
+# Summarize one Gmail thread by id, no search step (PR #28).
+PYTHONPATH=src python3 -m wolf.cli gmail-search-summarize \
+    --gmail-backend fake --thread-id thread_1 \
     --llm-backend fake --output text
 ```
 
@@ -366,6 +385,47 @@ like the word "command"). Critical markers still block.
 - See [`docs/setup/gmail.md`](../setup/gmail.md) for how to
   obtain a real access token, where to store it, and what
   scopes are needed.
+- **Full Gmail API audit (PR #28)** — every `gmail-*` command
+  records one `AuditEvent` to `var/audit/audit.jsonl`:
+  - `gmail.search` (actor `cli:gmail-search`): `provider`,
+    `query_length`, `max_results`, `hit_count`,
+    `enriched_count`, `skipped_count`.
+  - `gmail.read` (actor `cli:gmail-read`): `provider`,
+    `message_id`, `thread_id`, `subject`, `has_attachments`,
+    `attachments_count`, `body_total_bytes`.
+  - `gmail.thread` (actor `cli:gmail-thread`): `provider`,
+    `input_mode` (`query` | `message_id` | `thread_id`),
+    `query_length`, `message_count`, `thread_count`,
+    `skipped_count`.
+  - `gmail.search_summarize` (actor
+    `cli:gmail-search-summarize`): `provider`, `llm_backend`,
+    `input_mode`, `query_length`, `searched_count`,
+    `read_count`, `summarized_count`, `threaded`,
+    `thread_count`, `aggregate_summary_length`.
+  - `gmail.create_draft` is unchanged from PR #27.
+  - Raw mail body, draft body, access token, and the search
+    query string itself are NEVER recorded. Only metadata
+    counts and ids. If an audit write fails (`OSError`), the
+    CLI returns `stage=audit_log` with exit 2.
+
+## Traceability (PR #28)
+
+`gmail-search-summarize` JSON adds a `result.trace` block:
+
+```json
+"trace": {
+  "input_mode": "thread_id",
+  "gmail_backend": "fake",
+  "llm_backend": "fake",
+  "searched_count": 0,
+  "read_count": 2,
+  "summarized_count": 2,
+  "audit_event_count": 1
+}
+```
+
+Use it to correlate a run with the corresponding entries in
+`var/audit/audit.jsonl` without parsing the rest of the JSON.
 
 ## What this is not
 

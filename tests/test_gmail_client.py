@@ -281,6 +281,88 @@ class ReadRequestShapeAndParseTest(unittest.TestCase):
         self.assertEqual(m.body_text, "")
 
 
+class GetThreadRequestShapeAndParseTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self._td = TemporaryDirectory()
+        self.addCleanup(self._td.cleanup)
+        self.creds = GmailCredentials.from_path(_write_creds(Path(self._td.name)))
+        self.client = GmailClient(self.creds)
+
+    def test_get_thread_url_and_format(self) -> None:
+        captured: dict = {}
+
+        def fake_urlopen(req, timeout):  # noqa: ARG001
+            captured["url"] = req.full_url
+            captured["method"] = req.get_method()
+            captured["headers"] = dict(req.header_items())
+            return _fake_response(
+                {
+                    "id": "t1",
+                    "messages": [
+                        {
+                            "id": "abc",
+                            "threadId": "t1",
+                            "payload": {
+                                "headers": [
+                                    {"name": "Subject", "value": "Hello"},
+                                ],
+                                "mimeType": "text/plain",
+                                "body": {
+                                    "data": base64.urlsafe_b64encode(
+                                        b"body-1"
+                                    ).decode("ascii"),
+                                },
+                            },
+                        },
+                    ],
+                }
+            )
+
+        with patch.object(urllib.request, "urlopen", side_effect=fake_urlopen):
+            msgs = self.client.get_thread(thread_id="t1")
+
+        self.assertEqual(captured["method"], "GET")
+        self.assertIn("/gmail/v1/users/me/threads/t1", captured["url"])
+        self.assertIn("format=full", captured["url"])
+        # Bearer header propagated.
+        auth_lc = {k.lower(): v for k, v in captured["headers"].items()}
+        self.assertTrue(auth_lc.get("authorization", "").startswith("Bearer "))
+        self.assertEqual(len(msgs), 1)
+        self.assertEqual(msgs[0].subject, "Hello")
+        self.assertEqual(msgs[0].body_text, "body-1")
+
+    def test_get_thread_empty_messages_returns_empty(self) -> None:
+        def fake_urlopen(req, timeout):  # noqa: ARG001
+            return _fake_response({"id": "t1"})
+
+        with patch.object(urllib.request, "urlopen", side_effect=fake_urlopen):
+            msgs = self.client.get_thread(thread_id="t1")
+        self.assertEqual(msgs, ())
+
+    def test_get_thread_invalid_messages_field_raises(self) -> None:
+        def fake_urlopen(req, timeout):  # noqa: ARG001
+            return _fake_response({"messages": "not-a-list"})
+
+        with patch.object(urllib.request, "urlopen", side_effect=fake_urlopen):
+            with self.assertRaises(GmailClientError):
+                self.client.get_thread(thread_id="t1")
+
+    def test_get_thread_empty_id_raises(self) -> None:
+        with self.assertRaises(GmailClientError):
+            self.client.get_thread(thread_id="")
+
+    def test_get_thread_id_is_url_encoded(self) -> None:
+        captured: dict = {}
+
+        def fake_urlopen(req, timeout):  # noqa: ARG001
+            captured["url"] = req.full_url
+            return _fake_response({"messages": []})
+
+        with patch.object(urllib.request, "urlopen", side_effect=fake_urlopen):
+            self.client.get_thread(thread_id="t/with/slash")
+        self.assertIn("t%2Fwith%2Fslash", captured["url"])
+
+
 class CreateDraftRequestShapeTest(unittest.TestCase):
     def setUp(self) -> None:
         self._td = TemporaryDirectory()

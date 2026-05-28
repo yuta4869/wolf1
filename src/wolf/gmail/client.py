@@ -51,6 +51,7 @@ DEFAULT_TIMEOUT_SEC = 30.0
 LIST_PATH = "/gmail/v1/users/me/messages"
 GET_PATH = "/gmail/v1/users/me/messages/{id}"
 DRAFTS_PATH = "/gmail/v1/users/me/drafts"
+THREAD_PATH = "/gmail/v1/users/me/threads/{id}"
 
 _TOKEN_FIELD = "access_token"
 
@@ -220,6 +221,37 @@ class GmailClient:
         )
         decoded = self._get_json(url, label="read")
         return _parse_message(decoded)
+
+    def get_thread(self, *, thread_id: str) -> Tuple[GmailMessage, ...]:
+        """Fetch one thread and return its messages.
+
+        Calls GET /gmail/v1/users/me/threads/{id}?format=full and
+        parses each entry in `messages[]` through the same
+        `_parse_message` used by `read()`. Bodies are extracted
+        (text/plain preferred, HTML fallback) but the messages are
+        intentionally returned as a tuple — the caller decides what
+        to surface and whether to truncate.
+        """
+        if not isinstance(thread_id, str) or not thread_id.strip():
+            raise GmailClientError("thread_id must be a non-empty string")
+        safe_id = urllib.parse.quote(thread_id, safe="")
+        url = (
+            f"{self._base_url}"
+            f"{THREAD_PATH.format(id=safe_id)}"
+            f"?format=full"
+        )
+        decoded = self._get_json(url, label="get_thread")
+        msgs_raw = decoded.get("messages") or []
+        if not isinstance(msgs_raw, list):
+            raise GmailClientError(
+                "get_thread: 'messages' field is not a list"
+            )
+        out: List[GmailMessage] = []
+        for entry in msgs_raw:
+            if not isinstance(entry, dict):
+                continue
+            out.append(_parse_message(entry))
+        return tuple(out)
 
     def create_draft(
         self,

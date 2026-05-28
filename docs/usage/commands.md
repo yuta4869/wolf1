@@ -323,7 +323,7 @@ JSON `result` carries `draft_id`, `message_id`, `thread_id`,
 `var/audit/audit.jsonl` (PR #27 — never includes body text or
 the access token). See `docs/usage/gmail.md` for the full shape.
 
-### `gmail-thread` (PR #27)
+### `gmail-thread` (PR #27, extended PR #28)
 
 Group Gmail messages into threads using Gmail's server-side
 `threadId` first, with a normalized-subject fallback for
@@ -332,35 +332,49 @@ messages whose `threadId` is empty.
 ```sh
 python -m wolf.cli gmail-thread \
     --gmail-backend fake --query TEXT
+# Or fetch one thread directly (PR #28):
+python -m wolf.cli gmail-thread \
+    --gmail-backend fake --thread-id ID
 ```
 
-Key flags: `--query TEXT` OR `--message-id ID`, `--limit N`,
-Gmail flags (`--gmail-backend`, `--credentials-path`,
-`--gmail-base-url`, `--allow-non-https-gmail`),
-`--output {json,text}`. JSON `result.threads[]` carries
-`thread_id`, `subject`, `message_count`, `participants`,
-`first_date`, `last_date`, and a body-less `messages[]` array.
+Key flags: exactly one of `--query TEXT` / `--message-id ID` /
+`--thread-id ID` (mutually exclusive; passing two exits 2),
+`--limit N`, Gmail flags (`--gmail-backend`,
+`--credentials-path`, `--gmail-base-url`,
+`--allow-non-https-gmail`), `--output {json,text}`. JSON
+`result.threads[]` carries `thread_id`, `subject`,
+`message_count`, `participants`, `first_date`, `last_date`,
+and a body-less `messages[]` array. PR #28 writes one
+`action_kind=gmail.thread` event to `var/audit/audit.jsonl`
+with `input_mode` (`query` / `message_id` / `thread_id`) and
+counts.
 
-### `gmail-search-summarize` (PR #27)
+### `gmail-search-summarize` (PR #27, extended PR #28)
 
 Combine `gmail-search`, `gmail-read`, and per-message (or
-per-thread with `--threaded`) Router-mediated summarization,
-then produce one aggregate summary.
+per-thread with `--threaded` / `--thread-id`) Router-mediated
+summarization, then produce one aggregate summary.
 
 ```sh
 python -m wolf.cli gmail-search-summarize \
     --gmail-backend fake --query TEXT --llm-backend fake
+# Or skip search and pin to one thread (PR #28; implies --threaded):
+python -m wolf.cli gmail-search-summarize \
+    --gmail-backend fake --thread-id ID --llm-backend fake
 ```
 
-Key flags: `--query TEXT` OR `--message-id ID`, `--limit N`,
-Gmail flags as above, `--threaded`,
-`--include-per-message-summary`,
+Key flags: exactly one of `--query TEXT` / `--message-id ID` /
+`--thread-id ID`, `--limit N`, Gmail flags as above,
+`--threaded`, `--include-per-message-summary`,
 `--include-per-thread-summary`, LLM flags
 (`--llm-backend {fake,ollama}`, `--model NAME`, `--ollama-url`,
 `--allow-non-localhost-ollama`), `--output {json,text}`. The
 aggregate step runs under a Router with
 `allow_warning_injection_findings=True`; critical markers still
-block.
+block. JSON `result.trace` (PR #28) reports `input_mode`,
+`gmail_backend`, `llm_backend`, and per-stage counts. PR #28
+also writes one `action_kind=gmail.search_summarize` event
+per call.
 
 ### `check-path`
 

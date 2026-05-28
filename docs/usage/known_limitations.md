@@ -89,6 +89,25 @@ documented as out of scope.
   with exit 2 even though the draft has already been created
   on Gmail's side. Reconcile the audit log and the Gmail Drafts
   folder by hand in that case.
+- **All Gmail API calls audit fail-closed.** PR #28 extends
+  the same fail-closed audit pattern to `gmail.search`,
+  `gmail.read`, `gmail.thread`, and `gmail.search_summarize`.
+  If the audit write raises `OSError`, the corresponding CLI
+  command returns `stage=audit_log` with exit 2. The Gmail
+  read-side calls are idempotent so re-running is safe; for
+  `gmail.search_summarize` the LLM round-trips are not
+  retried automatically.
+- **Audit details are metadata only.** Audit events never
+  contain raw mail bodies, draft bodies, or the access token.
+  They also do not include the Gmail search query *content* —
+  only its length. Use the application logs (or a separate
+  audited mirror) if you need the query text for compliance.
+- **`gmail-thread --thread-id` is a single GET.** The
+  command fetches `GET /threads/{id}?format=full` and returns
+  one collapsed thread. Mutually exclusive with `--query` /
+  `--message-id`; passing two exits 2. The fake backend's
+  thread membership is whatever messages share the requested
+  `thread_id` in its in-memory list.
 - **Local mail (`.eml` / `.mbox` / Maildir) does not send either.**
   v0.2 added local `.eml` and `.mbox` read / search / draft via
   `mail-summarize`, `mail-search`, `mail-draft` (PR #22), and
