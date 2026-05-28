@@ -317,8 +317,50 @@ Key flags: `--message-id ID` (required), `--instruction TEXT`
 (required, treated as trusted), Gmail flags as above, LLM flags
 as above, `--body-preview-bytes N` (default 500), `--output`.
 JSON `result` carries `draft_id`, `message_id`, `thread_id`,
-`subject_suggestion`, `body_preview`, `body_truncated`. See
-`docs/usage/gmail.md` for the full shape.
+`subject_suggestion`, `body_preview`, `body_truncated`,
+`provider`. Each successful (and each failed) call writes one
+`action_kind=gmail.create_draft` event to
+`var/audit/audit.jsonl` (PR #27 — never includes body text or
+the access token). See `docs/usage/gmail.md` for the full shape.
+
+### `gmail-thread` (PR #27)
+
+Group Gmail messages into threads using Gmail's server-side
+`threadId` first, with a normalized-subject fallback for
+messages whose `threadId` is empty.
+
+```sh
+python -m wolf.cli gmail-thread \
+    --gmail-backend fake --query TEXT
+```
+
+Key flags: `--query TEXT` OR `--message-id ID`, `--limit N`,
+Gmail flags (`--gmail-backend`, `--credentials-path`,
+`--gmail-base-url`, `--allow-non-https-gmail`),
+`--output {json,text}`. JSON `result.threads[]` carries
+`thread_id`, `subject`, `message_count`, `participants`,
+`first_date`, `last_date`, and a body-less `messages[]` array.
+
+### `gmail-search-summarize` (PR #27)
+
+Combine `gmail-search`, `gmail-read`, and per-message (or
+per-thread with `--threaded`) Router-mediated summarization,
+then produce one aggregate summary.
+
+```sh
+python -m wolf.cli gmail-search-summarize \
+    --gmail-backend fake --query TEXT --llm-backend fake
+```
+
+Key flags: `--query TEXT` OR `--message-id ID`, `--limit N`,
+Gmail flags as above, `--threaded`,
+`--include-per-message-summary`,
+`--include-per-thread-summary`, LLM flags
+(`--llm-backend {fake,ollama}`, `--model NAME`, `--ollama-url`,
+`--allow-non-localhost-ollama`), `--output {json,text}`. The
+aggregate step runs under a Router with
+`allow_warning_injection_findings=True`; critical markers still
+block.
 
 ### `check-path`
 
