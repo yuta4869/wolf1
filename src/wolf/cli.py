@@ -2948,6 +2948,7 @@ def cmd_gmail_search(args: argparse.Namespace) -> int:
             detail={
                 "provider": provider,
                 "query_length": len(args.query or ""),
+                "query_fingerprint": _query_fingerprint(args.query),
                 "max_results": int(args.limit),
                 "hit_count": len(hits),
                 "enriched_count": len(enriched_messages),
@@ -3213,6 +3214,45 @@ def cmd_gmail_summarize(args: argparse.Namespace) -> int:
                 "summary": decision.result,
                 "summary_length": len(decision.result),
             }
+        )
+
+    provider = getattr(args, "gmail_backend", "fake")
+    llm_backend = getattr(args, "llm_backend", "fake")
+    searched_count = 0 if message_id else len(target_ids)
+    input_mode = "message_id" if message_id else "query"
+
+    # Audit the summarize stage (metadata only; query text is
+    # fingerprinted, not stored).
+    try:
+        _audit_gmail_api_event(
+            project_root=project_root,
+            actor="cli:gmail-summarize",
+            action_kind="gmail.summarize",
+            target=(
+                f"gmail-summarize:{message_id}"
+                if message_id else "gmail-summarize:search"
+            ),
+            outcome=(
+                "summarize_complete"
+                if summaries else "summarize_empty"
+            ),
+            decision="allow" if summaries else "deny",
+            detail={
+                "provider": provider,
+                "llm_backend": llm_backend,
+                "input_mode": input_mode,
+                "query_length": len(query or ""),
+                "query_fingerprint": _query_fingerprint(query),
+                "searched_count": searched_count,
+                "read_count": len(target_ids),
+                "summarized_count": len(summaries),
+            },
+        )
+    except OSError as exc:
+        return _emit_audit_fail_closed(
+            output_mode=output_mode,
+            action_kind="gmail.summarize",
+            exc=exc,
         )
 
     if output_mode == "text":
@@ -3537,6 +3577,29 @@ def _audit_gmail_api_event(
     audit.log(event)
 
 
+def _query_fingerprint(query: Optional[str]) -> Optional[str]:
+    """Stable 12-hex fingerprint of a search query string.
+
+    Used in Gmail audit events to correlate runs WITHOUT recording
+    the raw query content. Returns None for None / empty / pure
+    whitespace queries (so an audit consumer can distinguish "no
+    query" from a real fingerprint).
+
+    This is a correlation key, NOT a privacy primitive — the
+    fingerprint is reversible for short / well-known query strings
+    via a rainbow table. Treat audit consumers as trusted and the
+    fingerprint as "good enough to dedupe runs", nothing stronger.
+    """
+    import hashlib
+
+    if query is None:
+        return None
+    stripped = query.strip()
+    if not stripped:
+        return None
+    return hashlib.sha256(stripped.encode("utf-8")).hexdigest()[:12]
+
+
 def _emit_audit_fail_closed(
     *,
     output_mode: str,
@@ -3739,6 +3802,7 @@ def cmd_gmail_thread(args: argparse.Namespace) -> int:
                 "provider": provider,
                 "input_mode": input_mode,
                 "query_length": len(query or ""),
+                "query_fingerprint": _query_fingerprint(query),
                 "message_count": len(messages),
                 "thread_count": len(threads),
                 "skipped_count": len(skip),
@@ -4058,6 +4122,7 @@ def cmd_gmail_search_summarize(args: argparse.Namespace) -> int:
                 "llm_backend": llm_backend,
                 "input_mode": input_mode,
                 "query_length": len(query or ""),
+                "query_fingerprint": _query_fingerprint(query),
                 "searched_count": searched_count,
                 "read_count": len(messages),
                 "summarized_count": summarized_count,
@@ -4125,6 +4190,113 @@ def cmd_gmail_search_summarize(args: argparse.Namespace) -> int:
             "result": result,
         }
     )
+    return EXIT_SUCCESS
+
+
+def cmd_audit_tail(args: argparse.Namespace) -> int:
+    """Print the last N AuditLogger events from var/audit/audit.jsonl.
+
+    Missing audit file is treated as empty (exit 0). Malformed JSONL
+    lines are skipped with a stderr warning. Body / token content
+    is never re-injected by this command — we only re-print what is
+    already in the file, and the audit writer never recorded those
+    fields to begin with.
+    """
+    project_root = Path(args.project_root).resolve()
+    audit_path = _default_audit_path(project_root)
+    output_mode = getattr(args, "output", "json")
+    limit = int(getattr(args, "limit", 20))
+    action_kind_filter = getattr(args, "action_kind", None)
+
+    events: List[Dict[str, Any]] = []
+    malformed = 0
+    if audit_path.exists():
+        try:
+            with audit_path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    s = line.strip()
+                    if not s:
+                        continue
+                    try:
+                        rec = json.loads(s)
+                    except json.JSONDecodeError:
+                        malformed += 1
+                        continue
+                    if not isinstance(rec, dict):
+                        malformed += 1
+                        continue
+                    if (
+                        action_kind_filter
+                        and rec.get("action_kind") != action_kind_filter
+                    ):
+                        continue
+                    events.append(rec)
+        except OSError as exc:
+            sys.stderr.write(f"wolf cli: audit-tail: read failed ({type(exc).__name__})\n")
+            return EXIT_DENIED
+
+    if malformed:
+        sys.stderr.write(
+            f"wolf cli: audit-tail: skipped {malformed} malformed line(s)\n"
+        )
+
+    tail = events[-limit:] if limit > 0 else events
+
+    if output_mode == "text":
+        if not tail:
+            sys.stdout.write("(no audit events)\n")
+            return EXIT_SUCCESS
+        for ev in tail:
+            ts = ev.get("ts", "")
+            kind = ev.get("action_kind", "")
+            outcome = ev.get("outcome", "")
+            decision = ev.get("decision", "")
+            detail = ev.get("detail") or {}
+            compact_keys = (
+                "provider",
+                "input_mode",
+                "hit_count",
+                "thread_count",
+                "summarized_count",
+                "draft_id",
+                "source_message_id",
+            )
+            compact = " ".join(
+                f"{k}={detail[k]}" for k in compact_keys if k in detail
+            )
+            sys.stdout.write(
+                f"{ts}\t{kind}\t{decision}/{outcome}\t{compact}\n"
+            )
+        return EXIT_SUCCESS
+
+    payload = {
+        "allowed": True,
+        "executed": True,
+        "requires_confirmation": False,
+        "stage": "complete",
+        "reason": (
+            "audit-tail empty"
+            if not audit_path.exists()
+            else "audit-tail complete"
+        ),
+        "provider_called": False,
+        "audit_event_id": None,
+        "failed_checks": [],
+        "warnings": (
+            [f"audit-tail: skipped {malformed} malformed line(s)"]
+            if malformed else []
+        ),
+        "result": {
+            "audit_path": str(audit_path),
+            "audit_exists": audit_path.exists(),
+            "limit": limit,
+            "action_kind": action_kind_filter,
+            "event_count": len(tail),
+            "total_matched": len(events),
+            "events": tail,
+        },
+    }
+    _print_json(payload)
     return EXIT_SUCCESS
 
 
@@ -5369,6 +5541,28 @@ def build_parser() -> argparse.ArgumentParser:
         "--output", choices=("json", "text"), default="json",
     )
     gss.set_defaults(func=cmd_gmail_search_summarize)
+
+    # audit-tail
+    at = sub.add_parser(
+        "audit-tail",
+        help=(
+            "Print the last N events from var/audit/audit.jsonl. "
+            "Metadata only — no raw bodies or tokens are ever recorded "
+            "by the audit writer."
+        ),
+    )
+    at.add_argument(
+        "--limit", type=int, default=20,
+        help="Max events to print (default: 20)",
+    )
+    at.add_argument(
+        "--action-kind", default=None,
+        help="Filter events by action_kind exact match",
+    )
+    at.add_argument(
+        "--output", choices=("json", "text"), default="json",
+    )
+    at.set_defaults(func=cmd_audit_tail)
 
     cp = sub.add_parser(
         "check-path",

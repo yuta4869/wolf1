@@ -100,8 +100,17 @@ documented as out of scope.
 - **Audit details are metadata only.** Audit events never
   contain raw mail bodies, draft bodies, or the access token.
   They also do not include the Gmail search query *content* —
-  only its length. Use the application logs (or a separate
-  audited mirror) if you need the query text for compliance.
+  only its length and a `query_fingerprint` (SHA-256 first 12
+  hex, added in PR #29). The fingerprint is a correlation key,
+  not a privacy primitive: short or well-known queries are
+  reversible by a rainbow table. Use the application logs (or
+  a separate audited mirror) if you need the query text for
+  compliance.
+- **`audit-tail` re-prints whatever is in `audit.jsonl`** and
+  nothing else (PR #29). It does not re-fetch bodies or
+  recompute fields. Missing audit file returns an empty result
+  (exit 0). Malformed JSONL lines are skipped with a stderr
+  warning.
 - **`gmail-thread --thread-id` is a single GET.** The
   command fetches `GET /threads/{id}?format=full` and returns
   one collapsed thread. Mutually exclusive with `--query` /

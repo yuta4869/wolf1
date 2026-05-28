@@ -376,6 +376,25 @@ block. JSON `result.trace` (PR #28) reports `input_mode`,
 also writes one `action_kind=gmail.search_summarize` event
 per call.
 
+### `audit-tail` (PR #29)
+
+Re-print the last N events from `var/audit/audit.jsonl`. The
+audit file is whatever the Router / Gmail audit writers have
+appended; this command does not re-format bodies or tokens
+(none of which are stored to begin with).
+
+```sh
+python -m wolf.cli audit-tail --limit 20
+python -m wolf.cli audit-tail --action-kind gmail.create_draft
+python -m wolf.cli audit-tail --output text
+```
+
+Key flags: `--limit N` (default 20), `--action-kind KIND` (exact
+match filter), `--output {json,text}`. A missing audit file is
+treated as empty (exit 0). Malformed JSONL lines are skipped
+with a stderr warning. Text mode prints one line per event:
+`<ts>\t<action_kind>\t<decision>/<outcome>\t<compact details>`.
+
 ### `check-path`
 
 Run `ProjectBoundaryGuard` + `SensitivePathGuard` on a path. Does

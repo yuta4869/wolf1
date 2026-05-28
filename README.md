@@ -8,28 +8,38 @@ runs them through a small safety pipeline, and uses a local LLM
 This README documents the **v0.1** release scope. It is what is
 shipped after PR #1 through PR #21.
 
-## v0.2 in progress
+## v0.2.0 — local + Gmail mail workflows
 
-- `mail-summarize` / `mail-search` / `mail-draft` for local `.eml`
-  and `.mbox` files (PR #22). Read-only. No Gmail / IMAP / SMTP /
-  send. See [`docs/usage/mail.md`](docs/usage/mail.md).
-- `mail-thread` / `mail-search-summarize` plus UTC datetime filters
-  on every mail subcommand (PR #25).
-- `gmail-search` / `gmail-read` / `gmail-summarize` / `gmail-draft`
-  for opt-in Gmail integration (PR #26), plus `gmail-thread` /
-  `gmail-search-summarize` (PR #27) and AuditLogger entries for
-  every `gmail-draft create_draft` call. PR #28 extends audit
-  coverage to all Gmail API calls (`gmail.search`,
-  `gmail.read`, `gmail.thread`, `gmail.search_summarize`),
-  adds `--thread-id` direct fetch to `gmail-thread` and
-  `gmail-search-summarize`, and adds a `result.trace` block
-  with per-stage counts. Default backend is an in-memory fake;
-  the real Gmail backend requires `--credentials-path` to a
-  JSON file with `{"access_token": "..."}`. Read + draft only
-  — never sends. No OAuth browser login, no refresh-token flow,
-  no SMTP / IMAP. See
+`v0.2.0` is the second feature wave on top of the v0.1 safety
+foundation. CLI-only, local-first, **read + draft only — never
+sends**. Full release notes:
+[`docs/releases/v0.2.0.md`](docs/releases/v0.2.0.md).
+
+- **Local mail** (`mail-summarize` / `mail-search` / `mail-draft` /
+  `mail-thread` / `mail-search-summarize`): `.eml`, `.mbox`, and
+  Maildir; substring + UTC datetime filters; thread clustering;
+  bounded body output. No Gmail / IMAP / SMTP / send. See
+  [`docs/usage/mail.md`](docs/usage/mail.md).
+- **Gmail (opt-in)** (`gmail-search` / `gmail-read` /
+  `gmail-summarize` / `gmail-draft` / `gmail-thread` /
+  `gmail-search-summarize`): stdlib-`urllib` Gmail REST client.
+  Real backend requires `--gmail-backend gmail --credentials-path
+  PATH` to a JSON file with `{"access_token": "..."}`. No OAuth
+  browser login. No refresh-token flow. No `gmail.send` / SMTP /
+  IMAP anywhere in the codebase. See
   [`docs/usage/gmail.md`](docs/usage/gmail.md) and
   [`docs/setup/gmail.md`](docs/setup/gmail.md).
+- **Audit coverage**: every Gmail API call writes one event to
+  `var/audit/audit.jsonl` (`action_kind` ∈
+  `gmail.search` / `gmail.read` / `gmail.thread` /
+  `gmail.summarize` / `gmail.search_summarize` /
+  `gmail.create_draft`). Metadata only — `query_length` +
+  `query_fingerprint` (SHA-256 first 12 hex), counts, ids. The
+  access token, raw mail body, draft body, and Gmail query
+  *content* are never recorded.
+- **`audit-tail`**: re-print the last N audit events for
+  operator visibility (`audit-tail --limit 20 --action-kind
+  gmail.search`).
 
 ## What v0.1 covers
 

@@ -385,8 +385,9 @@ like the word "command"). Critical markers still block.
 - See [`docs/setup/gmail.md`](../setup/gmail.md) for how to
   obtain a real access token, where to store it, and what
   scopes are needed.
-- **Full Gmail API audit (PR #28)** — every `gmail-*` command
-  records one `AuditEvent` to `var/audit/audit.jsonl`:
+- **Full Gmail API audit (PR #28, extended PR #29)** — every
+  `gmail-*` command records one `AuditEvent` to
+  `var/audit/audit.jsonl`:
   - `gmail.search` (actor `cli:gmail-search`): `provider`,
     `query_length`, `max_results`, `hit_count`,
     `enriched_count`, `skipped_count`.
@@ -402,11 +403,23 @@ like the word "command"). Critical markers still block.
     `input_mode`, `query_length`, `searched_count`,
     `read_count`, `summarized_count`, `threaded`,
     `thread_count`, `aggregate_summary_length`.
+  - `gmail.summarize` (actor `cli:gmail-summarize`, PR #29):
+    `provider`, `llm_backend`, `input_mode` (`query` |
+    `message_id`), `query_length`, `query_fingerprint`,
+    `searched_count`, `read_count`, `summarized_count`.
   - `gmail.create_draft` is unchanged from PR #27.
   - Raw mail body, draft body, access token, and the search
     query string itself are NEVER recorded. Only metadata
-    counts and ids. If an audit write fails (`OSError`), the
-    CLI returns `stage=audit_log` with exit 2.
+    counts and ids. PR #29 adds `query_fingerprint`
+    (SHA-256 first 12 hex) so two runs of the same query can
+    be correlated without storing the query content. The
+    fingerprint is a correlation key, not a privacy primitive
+    — short / well-known queries are reversible by a rainbow
+    table; treat audit consumers as trusted. If an audit
+    write fails (`OSError`), the CLI returns
+    `stage=audit_log` with exit 2.
+  - Use `audit-tail` (PR #29) to inspect the last N events:
+    `python -m wolf.cli audit-tail --action-kind gmail.search`.
 
 ## Traceability (PR #28)
 
