@@ -144,6 +144,31 @@ class StepsAndGuardInvocationTest(unittest.TestCase):
             r"if:\s*github\.event_name\s*==\s*'pull_request'",
         )
 
+    def test_configures_ci_git_identity_before_identity_scan(self) -> None:
+        # PR #26: GitHub Actions runners do not ship a default git
+        # user.name/user.email. check-no-ai-attribution.sh --identity exits 2
+        # when either is unset, which blocked PRs #24 and #25. The workflow
+        # must configure a harmless non-AI identity before the --identity step.
+        self.assertIn('git config user.name "repo-ci"', self.content)
+        self.assertIn('git config user.email "repo-ci@example.invalid"', self.content)
+        # The config step must appear *before* the --identity scan step.
+        # Use the actual `run:` line, not the explanatory comment that
+        # references the script name.
+        cfg_idx = self.content.find('git config user.name "repo-ci"')
+        scan_idx = self.content.find(
+            "run: scripts/check-no-ai-attribution.sh --identity",
+        )
+        self.assertGreater(cfg_idx, 0)
+        self.assertGreater(scan_idx, 0)
+        self.assertLess(cfg_idx, scan_idx)
+
+    def test_ci_identity_contains_no_ai_markers(self) -> None:
+        # The CI identity must not contain "claude" or "anthropic" or it
+        # would trip the identity guard it is meant to satisfy.
+        for needle in ("claude", "anthropic"):
+            self.assertNotIn(needle, "repo-ci")
+            self.assertNotIn(needle, "repo-ci@example.invalid")
+
 
 class NetworkAndSecretsTest(unittest.TestCase):
     def setUp(self) -> None:

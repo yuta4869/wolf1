@@ -32,6 +32,18 @@ jobs:
       - name: Make guard executable
         run: chmod +x scripts/check-no-ai-attribution.sh
 
+      - name: Configure CI git identity for guard --identity
+        # GitHub Actions runners do not ship a default git user.name/user.email.
+        # check-no-ai-attribution.sh --identity exits 2 when either is unset,
+        # which blocked PRs #24 and #25 even though the actual commit and PR
+        # body were clean. Set a harmless non-AI identity for this job only.
+        # "repo-ci" / "repo-ci@example.invalid" contains neither "claude" nor
+        # "anthropic" (the only patterns the script's identity check matches),
+        # so it passes the guard without weakening the policy.
+        run: |
+          git config user.name "repo-ci"
+          git config user.email "repo-ci@example.invalid"
+
       - name: Scan HEAD commit (message + identity)
         run: scripts/check-no-ai-attribution.sh --commit HEAD
 
