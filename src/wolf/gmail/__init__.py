@@ -21,6 +21,7 @@ from .client import (
 )
 from .draft import build_reply_draft_raw
 from .fake import FakeGmailClient
+from .thread import GmailThread, GmailThreadMessage, build_threads
 from .types import GmailDraft, GmailMessage, GmailSearchHit
 
 __all__ = [
@@ -32,5 +33,8 @@ __all__ = [
     "GmailDraft",
     "GmailMessage",
     "GmailSearchHit",
+    "GmailThread",
+    "GmailThreadMessage",
     "build_reply_draft_raw",
+    "build_threads",
 ]

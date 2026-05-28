@@ -81,6 +81,24 @@ def _default_messages() -> List[GmailMessage]:
             ),
             label_ids=("INBOX",),
         ),
+        GmailMessage(
+            message_id="msg_4",
+            thread_id="thread_2",
+            subject="Re: Office snacks restock",
+            from_="Eve Example <eve@example.invalid>",
+            to="dora@example.invalid",
+            cc="me@example.invalid",
+            date="Wed, 22 May 2026 09:00:00 +0900",
+            rfc822_message_id="<fake-004@example.invalid>",
+            snippet="Same vendor as last time, or do we want to try the new place?",
+            body_text=(
+                "Same vendor as last time, or do we want to try the new "
+                "place?\n\nEve"
+            ),
+            has_attachments=False,
+            attachments=(),
+            label_ids=("INBOX",),
+        ),
     ]
 
 

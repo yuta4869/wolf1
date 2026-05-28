@@ -16,12 +16,15 @@ shipped after PR #1 through PR #21.
 - `mail-thread` / `mail-search-summarize` plus UTC datetime filters
   on every mail subcommand (PR #25).
 - `gmail-search` / `gmail-read` / `gmail-summarize` / `gmail-draft`
-  for opt-in Gmail integration (PR #26). Default backend is an
+  for opt-in Gmail integration (PR #26), plus `gmail-thread` /
+  `gmail-search-summarize` (PR #27) and AuditLogger entries for
+  every `gmail-draft create_draft` call. Default backend is an
   in-memory fake; the real Gmail backend requires
   `--credentials-path` to a JSON file with `{"access_token": "..."}`.
   Read + draft only — never sends. No OAuth browser login, no
   refresh-token flow, no SMTP / IMAP. See
-  [`docs/usage/gmail.md`](docs/usage/gmail.md).
+  [`docs/usage/gmail.md`](docs/usage/gmail.md) and
+  [`docs/setup/gmail.md`](docs/setup/gmail.md).
 
 ## What v0.1 covers
 

@@ -68,16 +68,27 @@ documented as out of scope.
 
 - **Gmail: read + draft only. Never send.** PR #26 adds opt-in
   Gmail integration via `gmail-search`, `gmail-read`,
-  `gmail-summarize`, and `gmail-draft`. The CLI calls the Gmail
-  REST API over `urllib` (stdlib only); no `google-api-python-client`
-  is bundled. There is **no** `users.messages.send`, no SMTP, no
-  IMAP. `gmail-draft` creates a Gmail draft via
-  `users.drafts.create`; you must finish or discard it inside
-  Gmail yourself. The default backend is the in-memory
-  `FakeGmailClient`; the real backend requires an explicit
-  `--credentials-path` to a JSON file with `{"access_token": "..."}`.
-  No OAuth browser login; no refresh-token flow. The token is
-  never refreshed by this CLI.
+  `gmail-summarize`, and `gmail-draft`. PR #27 adds the
+  workflow-level commands `gmail-thread` and
+  `gmail-search-summarize` plus AuditLogger integration for
+  `gmail-draft`. The CLI calls the Gmail REST API over `urllib`
+  (stdlib only); no `google-api-python-client` is bundled. There
+  is **no** `users.messages.send`, no SMTP, no IMAP.
+  `gmail-draft` creates a Gmail draft via `users.drafts.create`;
+  you must finish or discard it inside Gmail yourself. The
+  default backend is the in-memory `FakeGmailClient`; the real
+  backend requires an explicit `--credentials-path` to a JSON
+  file with `{"access_token": "..."}`. No OAuth browser login;
+  no refresh-token flow. The token is never refreshed by this
+  CLI. See [`docs/setup/gmail.md`](setup/gmail.md) for how to
+  obtain a token by hand.
+- **Gmail draft audit fails closed.** Every `gmail-draft` call
+  writes one `action_kind=gmail.create_draft` event to
+  `var/audit/audit.jsonl`. If the audit write itself fails
+  (disk full, permission), the CLI returns `stage=audit_log`
+  with exit 2 even though the draft has already been created
+  on Gmail's side. Reconcile the audit log and the Gmail Drafts
+  folder by hand in that case.
 - **Local mail (`.eml` / `.mbox` / Maildir) does not send either.**
   v0.2 added local `.eml` and `.mbox` read / search / draft via
   `mail-summarize`, `mail-search`, `mail-draft` (PR #22), and

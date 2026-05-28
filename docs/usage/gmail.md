@@ -26,7 +26,18 @@ backend is opt-in via `--gmail-backend gmail --credentials-path
   block).
 - `gmail-draft` — read one message, generate a reply via the LLM,
   and create the draft on Gmail (or the fake). The draft is NEVER
-  sent.
+  sent. Each create_draft call writes an `AuditEvent`
+  (`action_kind=gmail.create_draft`) to `var/audit/audit.jsonl`;
+  the event records the draft id, source message id, subject
+  suggestion, and `draft_body_length` — never the body text,
+  never the access token (PR #27).
+- `gmail-thread` (PR #27) — read messages and group them by
+  Gmail's `threadId`. When `threadId` is missing or empty, fall
+  back to the same lineage + normalized-subject strategy used by
+  `mail-thread`. Output is body-less metadata.
+- `gmail-search-summarize` (PR #27) — search → read → per-message
+  summary (default) or `--threaded` per-thread summary, then a
+  Router-mediated aggregate.
 
 ## Backends
 
@@ -96,6 +107,20 @@ PYTHONPATH=src python3 -m wolf.cli gmail-summarize \
 PYTHONPATH=src python3 -m wolf.cli gmail-draft \
     --gmail-backend fake --message-id msg_1 \
     --instruction "丁寧に返信して" \
+    --llm-backend fake --output text
+
+# Group messages into Gmail threads.
+PYTHONPATH=src python3 -m wolf.cli gmail-thread \
+    --gmail-backend fake --query "meeting"
+
+# Search → per-message summary → aggregate.
+PYTHONPATH=src python3 -m wolf.cli gmail-search-summarize \
+    --gmail-backend fake --query "meeting" \
+    --llm-backend fake
+
+# Search → per-thread summary → aggregate.
+PYTHONPATH=src python3 -m wolf.cli gmail-search-summarize \
+    --gmail-backend fake --query "meeting" --threaded \
     --llm-backend fake --output text
 ```
 
@@ -197,10 +222,111 @@ PYTHONPATH=src python3 -m wolf.cli gmail-draft \
     "body_preview": "First N bytes of the draft...",
     "body_preview_bytes": 500,
     "body_total_bytes": 946,
-    "body_truncated": true
+    "body_truncated": true,
+    "provider": "fake"
   }
 }
 ```
+
+### `gmail-thread` (PR #27)
+
+```json
+{
+  "stage": "complete",
+  "result": {
+    "message_count": 4,
+    "thread_count": 2,
+    "threads": [
+      {
+        "thread_id": "thread_1",
+        "subject": "Quarterly planning meeting",
+        "message_count": 2,
+        "participants": ["Alice Example <...>", "Bob Example <...>"],
+        "first_date": "Tue, 21 May 2026 09:00:00 +0900",
+        "last_date": "Tue, 21 May 2026 17:00:00 +0900",
+        "messages": [
+          {
+            "index": 0,
+            "gmail_message_id": "msg_1",
+            "rfc822_message_id": "<fake-001@example.invalid>",
+            "subject": "Quarterly planning meeting",
+            "from": "Alice Example <...>",
+            "date": "Tue, 21 May 2026 09:00:00 +0900"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+`messages[]` carries no body bytes. To render a thread, re-read
+each `gmail_message_id` via `gmail-read`.
+
+### `gmail-search-summarize` (PR #27)
+
+Per-message mode (default):
+
+```json
+{
+  "stage": "complete",
+  "result": {
+    "mode": "message",
+    "query": "meeting",
+    "message_count": 2,
+    "summarized_count": 2,
+    "summary": "Aggregate Router-mediated summary...",
+    "summary_length": 272,
+    "messages": [
+      {
+        "message_id": "msg_1",
+        "thread_id": "thread_1",
+        "subject": "...",
+        "from": "...",
+        "date": "...",
+        "summary_length": 272
+      }
+    ]
+  }
+}
+```
+
+Per-thread mode (`--threaded`):
+
+```json
+{
+  "stage": "complete",
+  "result": {
+    "mode": "threaded",
+    "query": "meeting",
+    "message_count": 2,
+    "summarized_count": 2,
+    "thread_count": 1,
+    "summary": "Aggregate Router-mediated summary...",
+    "summary_length": 272,
+    "threads": [
+      {
+        "thread_id": "thread_1",
+        "subject": "Quarterly planning meeting",
+        "message_count": 2,
+        "participants": ["Alice Example <...>", "Bob Example <...>"],
+        "summary_length": 272
+      }
+    ]
+  }
+}
+```
+
+Per-message / per-thread *summary text* is omitted by default to
+keep the JSON envelope small. Pass `--include-per-message-summary`
+or `--include-per-thread-summary` to attach the strings under
+`result.messages[].summary` / `result.threads[].summary`. The
+aggregate `result.summary` is always included.
+
+The aggregate step runs under a Router with
+`allow_warning_injection_findings=True` because its input is
+LLM-generated text (which often contains benign warning markers
+like the word "command"). Critical markers still block.
 
 ## Safety / privacy posture
 
@@ -226,6 +352,20 @@ PYTHONPATH=src python3 -m wolf.cli gmail-draft \
   bodies are not embedded in errors.
 - The real backend refuses non-https base URLs unless
   `--allow-non-https-gmail` is passed AND the host is localhost.
+- `gmail-draft` audit (PR #27): every `create_draft` call writes
+  one event to `var/audit/audit.jsonl` with
+  `action_kind=gmail.create_draft`. The event carries the draft
+  id, source message id, subject suggestion, and
+  `draft_body_length` — never the draft body text, never the
+  source body, never the access token. Failed attempts are
+  recorded with `outcome=draft_failed` and an `error_label` from
+  `GmailClientError`. If the audit write itself fails (disk
+  full, permission), the CLI fails closed with `stage=audit_log`
+  and exit 2, even though the draft was already created on
+  Gmail's side.
+- See [`docs/setup/gmail.md`](../setup/gmail.md) for how to
+  obtain a real access token, where to store it, and what
+  scopes are needed.
 
 ## What this is not
 
