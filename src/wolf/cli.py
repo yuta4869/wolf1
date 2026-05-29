@@ -4193,6 +4193,652 @@ def cmd_gmail_search_summarize(args: argparse.Namespace) -> int:
     return EXIT_SUCCESS
 
 
+def _audit_task_event(
+    *,
+    project_root: Path,
+    actor: str,
+    action_kind: str,
+    target: str,
+    outcome: str,
+    decision: str,
+    detail: Mapping[str, Any],
+) -> None:
+    """Write one AuditEvent for a task / calendar extraction run."""
+    from .core.audit import utc_now_iso
+    from .core.types import AuditEvent
+
+    audit = AuditLogger(_default_audit_path(project_root.resolve()))
+    event = AuditEvent(
+        ts=utc_now_iso(),
+        actor=actor,
+        action_kind=action_kind,
+        decision=decision,
+        target=target,
+        outcome=outcome,
+        detail=dict(detail),
+    )
+    audit.log(event)
+
+
+def _run_extraction_for_messages(
+    *,
+    llm: LLMAdapter,
+    router: Router,
+    messages: Sequence[Any],
+    source_kind: str,
+    body_attr: str = "body_text",
+    id_attr: str = "message_id",
+) -> "tuple[List[dict], List[dict], List[str]]":
+    """Extract tasks + events from each message via Router → LLM."""
+    from .tasks import extract_candidates_from_text, EXTRACTION_INSTRUCTION
+
+    tasks_out: List[dict] = []
+    events_out: List[dict] = []
+    warnings: List[str] = []
+    for m in messages:
+        body = getattr(m, body_attr, "") or ""
+        if not body.strip():
+            warnings.append(
+                f"{source_kind}: skipped empty body for "
+                f"{getattr(m, id_attr, '')}"
+            )
+            continue
+        source_id = getattr(m, id_attr, "") or ""
+        subject = getattr(m, "subject", "") or ""
+        from_ = getattr(m, "from_", "") or ""
+        prompt = (
+            f"{EXTRACTION_INSTRUCTION}\n\n<MAIL_BODY>\n{body}\n</MAIL_BODY>\n"
+        )
+        wrapped = wrap_untrusted(
+            prompt,
+            SourceKind.EMAIL,
+            source_ref=source_id,
+            metadata={"subject": subject, "from": from_},
+        )
+        decision = router.route(
+            RouterAction(
+                kind=ActionKind.LLM_SUMMARIZE_EMAIL,
+                risk_level=RiskLevel.LOW,
+                body=wrapped,
+            )
+        )
+        if not decision.allowed or not isinstance(decision.result, str):
+            warnings.append(
+                f"{source_kind}: extraction skipped {source_id} "
+                f"(stage={decision.stage})"
+            )
+            continue
+        extraction = extract_candidates_from_text(
+            llm_output=decision.result,
+            body=body,
+            source_kind=source_kind,
+            source_id=source_id,
+            source_subject=subject,
+            source_from=from_,
+        )
+        tasks_out.extend(t.to_dict() for t in extraction.tasks)
+        events_out.extend(e.to_dict() for e in extraction.events)
+        if extraction.warnings:
+            warnings.extend(extraction.warnings)
+    return tasks_out, events_out, warnings
+
+
+def _events_from_dicts(records: Sequence[Mapping[str, Any]]):
+    from .tasks.types import CalendarEventCandidate
+
+    out = []
+    for r in records:
+        out.append(
+            CalendarEventCandidate(
+                title=r.get("title", ""),
+                description=r.get("description", ""),
+                start_date=r.get("start_date", ""),
+                start_time=r.get("start_time", ""),
+                end_date=r.get("end_date", ""),
+                end_time=r.get("end_time", ""),
+                timezone=r.get("timezone", ""),
+                location=r.get("location", ""),
+                attendees=tuple(r.get("attendees", []) or ()),
+                source_kind=r.get("source_kind", ""),
+                source_id=r.get("source_id", ""),
+                source_subject=r.get("source_subject", ""),
+                confidence=float(r.get("confidence", 0.0)),
+                evidence_snippet=r.get("evidence_snippet", ""),
+            )
+        )
+    return out
+
+
+def _maybe_write_ics_file(
+    *,
+    ics_text: str,
+    project_root: Path,
+    out_path_arg: Optional[str],
+) -> Optional[Path]:
+    if not out_path_arg:
+        return None
+    target = Path(out_path_arg)
+    if not target.is_absolute():
+        target = (project_root / target).resolve()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(ics_text, encoding="utf-8")
+    return target
+
+
+def cmd_task_extract_mail(args: argparse.Namespace) -> int:
+    project_root = Path(args.project_root).resolve()
+    output_mode = getattr(args, "output", "json")
+
+    try:
+        llm = _build_llm_from_args(args)
+    except ValueError as exc:
+        sys.stderr.write(f"wolf cli: {exc}\n")
+        return EXIT_DENIED
+
+    router = _build_router(
+        project_root, llm=llm,
+        config=RouterConfig(allow_warning_injection_findings=False),
+    )
+
+    gate = _gate_mail_path(
+        router=router, path_str=args.path, output_mode=output_mode
+    )
+    if gate is not None:
+        return _emit_decision(gate, output_mode=output_mode, include_result=False)
+
+    path = Path(args.path)
+    if not path.is_absolute():
+        path = (project_root / path).resolve()
+    try:
+        result = _read_mail_with_args(args=args, path=path)
+    except ValueError as exc:
+        sys.stderr.write(f"wolf cli: {exc}\n")
+        return EXIT_DENIED
+    except MailReadError as exc:
+        if output_mode == "text":
+            sys.stderr.write(f"wolf cli: mail_read failed: {exc.label}\n")
+        else:
+            _print_json(_gmail_error_decision(exc.label, stage="mail_read"))
+        return EXIT_DENIED
+
+    if not result.messages:
+        if output_mode == "text":
+            sys.stderr.write("wolf cli: no mail messages found\n")
+        else:
+            _print_json(
+                {
+                    "allowed": False, "executed": False,
+                    "requires_confirmation": False,
+                    "stage": "mail_read", "reason": "no messages",
+                    "provider_called": False, "audit_event_id": None,
+                    "failed_checks": [], "warnings": list(result.skipped),
+                }
+            )
+        return EXIT_DENIED
+
+    tasks_out, events_out, warnings = _run_extraction_for_messages(
+        llm=llm, router=router, messages=result.messages,
+        source_kind="local_mail", body_attr="body", id_attr="message_id",
+    )
+
+    try:
+        _audit_task_event(
+            project_root=project_root,
+            actor="cli:task-extract-mail",
+            action_kind="task.extract_mail",
+            target=f"local_mail:{path}",
+            outcome=(
+                "extract_complete" if (tasks_out or events_out) else "extract_empty"
+            ),
+            decision="allow",
+            detail={
+                "source_kind": "local_mail",
+                "provider": getattr(args, "backend", "fake"),
+                "output_mode": output_mode,
+                "message_count": len(result.messages),
+                "task_count": len(tasks_out),
+                "event_count": len(events_out),
+            },
+        )
+    except OSError as exc:
+        return _emit_audit_fail_closed(
+            output_mode=output_mode,
+            action_kind="task.extract_mail",
+            exc=exc,
+        )
+
+    if output_mode == "text":
+        if not tasks_out and not events_out:
+            sys.stdout.write("(no tasks or events extracted)\n")
+            return EXIT_SUCCESS
+        for t in tasks_out:
+            due = t.get("due_date") or "no-date"
+            sys.stdout.write(f"TASK\t{due}\t{t['title']}\n")
+        for e in events_out:
+            d = e.get("start_date") or "no-date"
+            t_ = e.get("start_time") or "all-day"
+            sys.stdout.write(f"EVENT\t{d} {t_}\t{e['title']}\n")
+        return EXIT_SUCCESS
+
+    _print_json(
+        {
+            "allowed": True, "executed": True,
+            "requires_confirmation": False,
+            "stage": "complete",
+            "reason": "task extraction complete",
+            "provider_called": True, "audit_event_id": None,
+            "failed_checks": [],
+            "warnings": warnings + list(result.skipped),
+            "result": {
+                "source_kind": "local_mail",
+                "message_count": len(result.messages),
+                "task_count": len(tasks_out),
+                "event_count": len(events_out),
+                "tasks": tasks_out,
+                "events": events_out,
+            },
+        }
+    )
+    return EXIT_SUCCESS
+
+
+def cmd_task_extract_gmail(args: argparse.Namespace) -> int:
+    project_root = Path(args.project_root).resolve()
+    output_mode = getattr(args, "output", "json")
+    provider = getattr(args, "gmail_backend", "fake")
+    llm_backend = getattr(args, "llm_backend", "fake")
+
+    try:
+        client = _build_gmail_client_from_args(args)
+    except GmailClientError as exc:
+        if output_mode == "text":
+            sys.stderr.write(f"wolf cli: gmail config error: {exc.label}\n")
+        else:
+            _print_json(_gmail_error_decision(exc.label, stage="gmail_config"))
+        return EXIT_DENIED
+
+    try:
+        llm = _build_llm_for_gmail(args)
+    except ValueError as exc:
+        sys.stderr.write(f"wolf cli: {exc}\n")
+        return EXIT_DENIED
+
+    router = _build_router(
+        project_root, llm=llm,
+        config=RouterConfig(allow_warning_injection_findings=False),
+    )
+
+    query = getattr(args, "query", None)
+    message_id = getattr(args, "message_id", None)
+    if not query and not message_id:
+        sys.stderr.write(
+            "wolf cli: task-extract-gmail requires --query or --message-id\n"
+        )
+        return EXIT_DENIED
+
+    if message_id:
+        ids = [message_id]
+    else:
+        try:
+            hits = client.search(query=query, max_results=int(args.limit))
+        except GmailClientError as exc:
+            if output_mode == "text":
+                sys.stderr.write(f"wolf cli: {exc.label}\n")
+            else:
+                _print_json(_gmail_error_decision(exc.label, stage="gmail_search"))
+            return EXIT_DENIED
+        ids = [h.message_id for h in hits]
+
+    messages, skip = _read_gmail_messages(client=client, ids=ids)
+    if not messages:
+        if output_mode == "text":
+            sys.stderr.write("wolf cli: no gmail messages found\n")
+        else:
+            _print_json(
+                {
+                    "allowed": False, "executed": False,
+                    "requires_confirmation": False,
+                    "stage": "gmail_search", "reason": "no messages",
+                    "provider_called": False, "audit_event_id": None,
+                    "failed_checks": [], "warnings": skip,
+                }
+            )
+        return EXIT_DENIED
+
+    tasks_out, events_out, warnings = _run_extraction_for_messages(
+        llm=llm, router=router, messages=messages,
+        source_kind="gmail", body_attr="body_text", id_attr="message_id",
+    )
+    warnings = list(skip) + warnings
+
+    try:
+        _audit_task_event(
+            project_root=project_root,
+            actor="cli:task-extract-gmail",
+            action_kind="task.extract_gmail",
+            target=f"gmail:{message_id or 'search'}",
+            outcome=(
+                "extract_complete" if (tasks_out or events_out) else "extract_empty"
+            ),
+            decision="allow",
+            detail={
+                "source_kind": "gmail",
+                "provider": provider,
+                "llm_backend": llm_backend,
+                "output_mode": output_mode,
+                "query_length": len(query or ""),
+                "query_fingerprint": _query_fingerprint(query),
+                "message_count": len(messages),
+                "task_count": len(tasks_out),
+                "event_count": len(events_out),
+            },
+        )
+    except OSError as exc:
+        return _emit_audit_fail_closed(
+            output_mode=output_mode,
+            action_kind="task.extract_gmail",
+            exc=exc,
+        )
+
+    if output_mode == "text":
+        if not tasks_out and not events_out:
+            sys.stdout.write("(no tasks or events extracted)\n")
+            return EXIT_SUCCESS
+        for t in tasks_out:
+            due = t.get("due_date") or "no-date"
+            sys.stdout.write(f"TASK\t{due}\t{t['title']}\n")
+        for e in events_out:
+            d = e.get("start_date") or "no-date"
+            t_ = e.get("start_time") or "all-day"
+            sys.stdout.write(f"EVENT\t{d} {t_}\t{e['title']}\n")
+        return EXIT_SUCCESS
+
+    _print_json(
+        {
+            "allowed": True, "executed": True,
+            "requires_confirmation": False,
+            "stage": "complete",
+            "reason": "task extraction complete",
+            "provider_called": True, "audit_event_id": None,
+            "failed_checks": [],
+            "warnings": warnings,
+            "result": {
+                "source_kind": "gmail",
+                "message_count": len(messages),
+                "task_count": len(tasks_out),
+                "event_count": len(events_out),
+                "tasks": tasks_out,
+                "events": events_out,
+            },
+        }
+    )
+    return EXIT_SUCCESS
+
+
+def _emit_calendar_draft(
+    *,
+    project_root: Path,
+    events_out: List[dict],
+    output_mode: str,
+    out_file_arg: Optional[str],
+    extra_warnings: List[str],
+    audit_kwargs: Mapping[str, Any],
+) -> int:
+    from .tasks import build_ics
+
+    candidates = _events_from_dicts(events_out)
+    ics_text = build_ics(candidates) if candidates else ""
+    written_path: Optional[Path] = None
+    try:
+        written_path = _maybe_write_ics_file(
+            ics_text=ics_text,
+            project_root=project_root,
+            out_path_arg=out_file_arg,
+        )
+    except OSError as exc:
+        if output_mode == "text":
+            sys.stderr.write(
+                f"wolf cli: calendar-draft: write failed ({type(exc).__name__})\n"
+            )
+        else:
+            _print_json(
+                _gmail_error_decision(
+                    f"calendar-draft: write failed ({type(exc).__name__})",
+                    stage="calendar_write",
+                )
+            )
+        return EXIT_DENIED
+
+    try:
+        merged_detail = dict(audit_kwargs.get("detail", {}))
+        merged_detail.update({
+            "event_count": len(events_out),
+            "output_mode": output_mode,
+            "wrote_file": bool(written_path),
+        })
+        _audit_task_event(
+            project_root=project_root,
+            actor=audit_kwargs["actor"],
+            action_kind=audit_kwargs["action_kind"],
+            target=audit_kwargs["target"],
+            outcome=audit_kwargs["outcome"],
+            decision=audit_kwargs["decision"],
+            detail=merged_detail,
+        )
+    except OSError as exc:
+        return _emit_audit_fail_closed(
+            output_mode=output_mode,
+            action_kind=audit_kwargs.get("action_kind", "calendar.draft"),
+            exc=exc,
+        )
+
+    if output_mode == "ics":
+        sys.stdout.write(ics_text)
+        return EXIT_SUCCESS
+    if output_mode == "text":
+        if not events_out:
+            sys.stdout.write("(no events extracted)\n")
+            return EXIT_SUCCESS
+        for e in events_out:
+            d = e.get("start_date") or "no-date"
+            t_ = e.get("start_time") or "all-day"
+            sys.stdout.write(f"EVENT\t{d} {t_}\t{e['title']}\n")
+        if written_path:
+            sys.stdout.write(f"WROTE\t{written_path}\n")
+        return EXIT_SUCCESS
+
+    _print_json(
+        {
+            "allowed": True, "executed": True,
+            "requires_confirmation": False,
+            "stage": "complete",
+            "reason": "calendar draft complete",
+            "provider_called": True, "audit_event_id": None,
+            "failed_checks": [],
+            "warnings": extra_warnings,
+            "result": {
+                "event_count": len(events_out),
+                "events": events_out,
+                "ics": ics_text,
+                "wrote_file": str(written_path) if written_path else None,
+            },
+        }
+    )
+    return EXIT_SUCCESS
+
+
+def cmd_calendar_draft_mail(args: argparse.Namespace) -> int:
+    project_root = Path(args.project_root).resolve()
+    output_mode = getattr(args, "output", "json")
+
+    try:
+        llm = _build_llm_from_args(args)
+    except ValueError as exc:
+        sys.stderr.write(f"wolf cli: {exc}\n")
+        return EXIT_DENIED
+    router = _build_router(
+        project_root, llm=llm,
+        config=RouterConfig(allow_warning_injection_findings=False),
+    )
+
+    gate = _gate_mail_path(
+        router=router, path_str=args.path, output_mode=output_mode
+    )
+    if gate is not None:
+        return _emit_decision(gate, output_mode=output_mode, include_result=False)
+
+    path = Path(args.path)
+    if not path.is_absolute():
+        path = (project_root / path).resolve()
+    try:
+        result = _read_mail_with_args(args=args, path=path)
+    except ValueError as exc:
+        sys.stderr.write(f"wolf cli: {exc}\n")
+        return EXIT_DENIED
+    except MailReadError as exc:
+        if output_mode == "text":
+            sys.stderr.write(f"wolf cli: mail_read failed: {exc.label}\n")
+        else:
+            _print_json(_gmail_error_decision(exc.label, stage="mail_read"))
+        return EXIT_DENIED
+
+    if not result.messages:
+        if output_mode == "text":
+            sys.stderr.write("wolf cli: no mail messages found\n")
+        else:
+            _print_json(
+                {
+                    "allowed": False, "executed": False,
+                    "requires_confirmation": False,
+                    "stage": "mail_read", "reason": "no messages",
+                    "provider_called": False, "audit_event_id": None,
+                    "failed_checks": [], "warnings": list(result.skipped),
+                }
+            )
+        return EXIT_DENIED
+
+    _tasks_out, events_out, warnings = _run_extraction_for_messages(
+        llm=llm, router=router, messages=result.messages,
+        source_kind="local_mail", body_attr="body", id_attr="message_id",
+    )
+    extra_warnings = list(result.skipped) + warnings
+
+    return _emit_calendar_draft(
+        project_root=project_root,
+        events_out=events_out,
+        output_mode=output_mode,
+        out_file_arg=getattr(args, "output_file", None),
+        extra_warnings=extra_warnings,
+        audit_kwargs={
+            "actor": "cli:calendar-draft-mail",
+            "action_kind": "calendar.draft_mail",
+            "target": f"local_mail:{path}",
+            "outcome": ("draft_complete" if events_out else "draft_empty"),
+            "decision": "allow" if events_out else "deny",
+            "detail": {
+                "source_kind": "local_mail",
+                "provider": getattr(args, "backend", "fake"),
+                "message_count": len(result.messages),
+                "task_count": len(_tasks_out),
+            },
+        },
+    )
+
+
+def cmd_calendar_draft_gmail(args: argparse.Namespace) -> int:
+    project_root = Path(args.project_root).resolve()
+    output_mode = getattr(args, "output", "json")
+    provider = getattr(args, "gmail_backend", "fake")
+    llm_backend = getattr(args, "llm_backend", "fake")
+
+    try:
+        client = _build_gmail_client_from_args(args)
+    except GmailClientError as exc:
+        if output_mode == "text":
+            sys.stderr.write(f"wolf cli: gmail config error: {exc.label}\n")
+        else:
+            _print_json(_gmail_error_decision(exc.label, stage="gmail_config"))
+        return EXIT_DENIED
+
+    try:
+        llm = _build_llm_for_gmail(args)
+    except ValueError as exc:
+        sys.stderr.write(f"wolf cli: {exc}\n")
+        return EXIT_DENIED
+
+    router = _build_router(
+        project_root, llm=llm,
+        config=RouterConfig(allow_warning_injection_findings=False),
+    )
+
+    query = getattr(args, "query", None)
+    message_id = getattr(args, "message_id", None)
+    if not query and not message_id:
+        sys.stderr.write(
+            "wolf cli: calendar-draft-gmail requires --query or --message-id\n"
+        )
+        return EXIT_DENIED
+
+    if message_id:
+        ids = [message_id]
+    else:
+        try:
+            hits = client.search(query=query, max_results=int(args.limit))
+        except GmailClientError as exc:
+            if output_mode == "text":
+                sys.stderr.write(f"wolf cli: {exc.label}\n")
+            else:
+                _print_json(_gmail_error_decision(exc.label, stage="gmail_search"))
+            return EXIT_DENIED
+        ids = [h.message_id for h in hits]
+
+    messages, skip = _read_gmail_messages(client=client, ids=ids)
+    if not messages:
+        if output_mode == "text":
+            sys.stderr.write("wolf cli: no gmail messages found\n")
+        else:
+            _print_json(
+                {
+                    "allowed": False, "executed": False,
+                    "requires_confirmation": False,
+                    "stage": "gmail_search", "reason": "no messages",
+                    "provider_called": False, "audit_event_id": None,
+                    "failed_checks": [], "warnings": skip,
+                }
+            )
+        return EXIT_DENIED
+
+    _tasks_out, events_out, warnings = _run_extraction_for_messages(
+        llm=llm, router=router, messages=messages,
+        source_kind="gmail", body_attr="body_text", id_attr="message_id",
+    )
+    extra_warnings = list(skip) + warnings
+
+    return _emit_calendar_draft(
+        project_root=project_root,
+        events_out=events_out,
+        output_mode=output_mode,
+        out_file_arg=getattr(args, "output_file", None),
+        extra_warnings=extra_warnings,
+        audit_kwargs={
+            "actor": "cli:calendar-draft-gmail",
+            "action_kind": "calendar.draft_gmail",
+            "target": f"gmail:{message_id or 'search'}",
+            "outcome": ("draft_complete" if events_out else "draft_empty"),
+            "decision": "allow" if events_out else "deny",
+            "detail": {
+                "source_kind": "gmail",
+                "provider": provider,
+                "llm_backend": llm_backend,
+                "query_length": len(query or ""),
+                "query_fingerprint": _query_fingerprint(query),
+                "message_count": len(messages),
+                "task_count": len(_tasks_out),
+            },
+        },
+    )
+
+
 def cmd_audit_tail(args: argparse.Namespace) -> int:
     """Print the last N AuditLogger events from var/audit/audit.jsonl.
 
@@ -5543,6 +6189,151 @@ def build_parser() -> argparse.ArgumentParser:
     gss.set_defaults(func=cmd_gmail_search_summarize)
 
     # audit-tail
+    # task-extract-mail (PR #30)
+    tem = sub.add_parser(
+        "task-extract-mail",
+        help=(
+            "Extract task / calendar candidates from a local .eml / "
+            ".mbox / Maildir. LLM-mediated with deterministic regex "
+            "fallback. No calendar registration, no send."
+        ),
+    )
+    tem.add_argument(
+        "--path", required=True, help=".eml, .mbox, or Maildir directory"
+    )
+    tem.add_argument(
+        "--limit", type=int, default=MAIL_DEFAULT_MBOX_LIMIT,
+        help="Max messages to scan (default: 10)",
+    )
+    tem.add_argument(
+        "--max-bytes", type=int, default=MAIL_DEFAULT_MAX_BODY,
+    )
+    tem.add_argument("--filter-since", default=None)
+    tem.add_argument("--filter-until", default=None)
+    tem.add_argument(
+        "--filter-subject", action="append", default=None,
+    )
+    tem.add_argument(
+        "--filter-from", action="append", default=None,
+    )
+    tem.add_argument(
+        "--filter-body-contains", action="append", default=None,
+    )
+    tem.add_argument(
+        "--backend", choices=("fake", "ollama"), default="fake",
+    )
+    tem.add_argument("--model", default=None)
+    tem.add_argument("--ollama-url", default=None)
+    tem.add_argument("--allow-non-localhost-ollama", action="store_true")
+    tem.add_argument(
+        "--output", choices=("json", "text"), default="json",
+    )
+    tem.set_defaults(func=cmd_task_extract_mail)
+
+    # task-extract-gmail (PR #30)
+    teg = sub.add_parser(
+        "task-extract-gmail",
+        help=(
+            "Extract task / calendar candidates from one or more "
+            "Gmail messages. No send, no calendar registration."
+        ),
+    )
+    teg.add_argument("--query", default=None)
+    teg.add_argument("--message-id", default=None)
+    teg.add_argument(
+        "--limit", type=int, default=GMAIL_DEFAULT_LIMIT,
+    )
+    teg.add_argument(
+        "--gmail-backend", choices=("fake", "gmail"), default="fake",
+    )
+    teg.add_argument("--credentials-path", default=None)
+    teg.add_argument("--gmail-base-url", default=None)
+    teg.add_argument("--allow-non-https-gmail", action="store_true")
+    teg.add_argument(
+        "--llm-backend", choices=("fake", "ollama"), default="fake",
+    )
+    teg.add_argument("--model", default=None)
+    teg.add_argument("--ollama-url", default=None)
+    teg.add_argument("--allow-non-localhost-ollama", action="store_true")
+    teg.add_argument(
+        "--output", choices=("json", "text"), default="json",
+    )
+    teg.set_defaults(func=cmd_task_extract_gmail)
+
+    # calendar-draft-mail (PR #30)
+    cdm = sub.add_parser(
+        "calendar-draft-mail",
+        help=(
+            "Build a draft iCalendar (.ics) from local mail. The "
+            "output is text only; nothing is sent or registered."
+        ),
+    )
+    cdm.add_argument("--path", required=True)
+    cdm.add_argument(
+        "--limit", type=int, default=MAIL_DEFAULT_MBOX_LIMIT,
+    )
+    cdm.add_argument(
+        "--max-bytes", type=int, default=MAIL_DEFAULT_MAX_BODY,
+    )
+    cdm.add_argument("--filter-since", default=None)
+    cdm.add_argument("--filter-until", default=None)
+    cdm.add_argument(
+        "--filter-subject", action="append", default=None,
+    )
+    cdm.add_argument(
+        "--filter-from", action="append", default=None,
+    )
+    cdm.add_argument(
+        "--filter-body-contains", action="append", default=None,
+    )
+    cdm.add_argument(
+        "--backend", choices=("fake", "ollama"), default="fake",
+    )
+    cdm.add_argument("--model", default=None)
+    cdm.add_argument("--ollama-url", default=None)
+    cdm.add_argument("--allow-non-localhost-ollama", action="store_true")
+    cdm.add_argument(
+        "--output-file", default=None,
+        help="Write the .ics to this path (resolved under project-root if relative)",
+    )
+    cdm.add_argument(
+        "--output", choices=("json", "text", "ics"), default="json",
+    )
+    cdm.set_defaults(func=cmd_calendar_draft_mail)
+
+    # calendar-draft-gmail (PR #30)
+    cdg = sub.add_parser(
+        "calendar-draft-gmail",
+        help=(
+            "Build a draft iCalendar (.ics) from Gmail messages. "
+            "No send, no calendar registration."
+        ),
+    )
+    cdg.add_argument("--query", default=None)
+    cdg.add_argument("--message-id", default=None)
+    cdg.add_argument(
+        "--limit", type=int, default=GMAIL_DEFAULT_LIMIT,
+    )
+    cdg.add_argument(
+        "--gmail-backend", choices=("fake", "gmail"), default="fake",
+    )
+    cdg.add_argument("--credentials-path", default=None)
+    cdg.add_argument("--gmail-base-url", default=None)
+    cdg.add_argument("--allow-non-https-gmail", action="store_true")
+    cdg.add_argument(
+        "--llm-backend", choices=("fake", "ollama"), default="fake",
+    )
+    cdg.add_argument("--model", default=None)
+    cdg.add_argument("--ollama-url", default=None)
+    cdg.add_argument("--allow-non-localhost-ollama", action="store_true")
+    cdg.add_argument(
+        "--output-file", default=None,
+    )
+    cdg.add_argument(
+        "--output", choices=("json", "text", "ics"), default="json",
+    )
+    cdg.set_defaults(func=cmd_calendar_draft_gmail)
+
     at = sub.add_parser(
         "audit-tail",
         help=(

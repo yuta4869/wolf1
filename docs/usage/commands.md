@@ -376,6 +376,73 @@ block. JSON `result.trace` (PR #28) reports `input_mode`,
 also writes one `action_kind=gmail.search_summarize` event
 per call.
 
+### `task-extract-mail` (PR #30)
+
+Extract task and calendar-event candidates from a local
+`.eml` / `.mbox` / Maildir. Mail-strict prompt-injection scan.
+No send, no calendar registration.
+
+```sh
+python -m wolf.cli task-extract-mail --path PATH [options]
+```
+
+Key flags: `--path PATH` (required), `--limit N`, `--max-bytes N`,
+the same `--filter-*` flags as `mail-summarize`,
+`--backend {fake,ollama}`, `--model NAME`, `--ollama-url`,
+`--allow-non-localhost-ollama`, `--output {json,text}`. JSON
+`result.tasks[]` and `result.events[]` carry bounded
+`evidence_snippet` only; the raw body is never embedded.
+
+### `task-extract-gmail` (PR #30)
+
+Same as above but read from Gmail (default fake backend).
+
+```sh
+python -m wolf.cli task-extract-gmail \
+    --gmail-backend fake --query TEXT --llm-backend fake
+```
+
+Key flags: exactly one of `--query TEXT` / `--message-id ID`,
+`--limit N`, Gmail flags (`--gmail-backend`,
+`--credentials-path`, `--gmail-base-url`,
+`--allow-non-https-gmail`), LLM flags
+(`--llm-backend {fake,ollama}`, `--model NAME`,
+`--ollama-url`, `--allow-non-localhost-ollama`),
+`--output {json,text}`.
+
+### `calendar-draft-mail` (PR #30)
+
+Read a local mailbox, extract events, and emit a draft
+iCalendar (`.ics`).
+
+```sh
+python -m wolf.cli calendar-draft-mail \
+    --path PATH --output ics
+# Or write to a file:
+python -m wolf.cli calendar-draft-mail \
+    --path PATH --output text --output-file ./var/out/events.ics
+```
+
+Key flags: as `task-extract-mail` plus
+`--output {json,text,ics}` and
+`--output-file PATH` (relative paths resolved under
+`--project-root`). Nothing is sent or registered with a real
+calendar.
+
+### `calendar-draft-gmail` (PR #30)
+
+Same as above but read from Gmail.
+
+```sh
+python -m wolf.cli calendar-draft-gmail \
+    --gmail-backend fake --query TEXT --llm-backend fake \
+    --output ics
+```
+
+Key flags: as `task-extract-gmail` plus
+`--output {json,text,ics}` and
+`--output-file PATH`.
+
 ### `audit-tail` (PR #29)
 
 Re-print the last N events from `var/audit/audit.jsonl`. The

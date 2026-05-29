@@ -1,0 +1,19 @@
+From: Alice Example <alice@example.invalid>
+To: team@example.invalid
+Subject: Q3 prep — actions and meeting
+Date: Tue, 21 May 2026 09:00:00 +0900
+Message-ID: <tasks-001@example.invalid>
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+
+Hi team,
+
+A few things to lock down before the next sync:
+
+Action item: Send the Q3 numbers to Alice by 2026-06-10
+Action item: Confirm the budget freeze on 2026-06-12
+Due: 2026-06-15
+Meeting: Quarterly planning sync on 2026-06-18 14:00
+
+Thanks,
+Alice

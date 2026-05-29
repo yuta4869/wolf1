@@ -111,6 +111,20 @@ documented as out of scope.
   recompute fields. Missing audit file returns an empty result
   (exit 0). Malformed JSONL lines are skipped with a stderr
   warning.
+- **Task / calendar extraction is candidate-only (PR #30).**
+  `task-extract-mail`, `task-extract-gmail`,
+  `calendar-draft-mail`, and `calendar-draft-gmail` produce
+  `TaskCandidate` records and draft `.ics` text. No Google
+  Calendar API integration, no event creation, no invitation,
+  no notification. The `.ics` writer emits a minimal
+  `VCALENDAR` (no `RRULE`, no `VALARM`, no `ORGANIZER`); the
+  user is responsible for importing it.
+- **Extraction fallback is regex.** When the LLM does not
+  return JSON (e.g. the in-process `FakeLLM`, or a real model
+  that ignored the prompt), the extractor falls back to a
+  deterministic regex over `Action item:` / `Due:` /
+  `Meeting:` lines with ISO dates. Free-form
+  "next Thursday at 3pm" is not picked up by the fallback.
 - **`gmail-thread --thread-id` is a single GET.** The
   command fetches `GET /threads/{id}?format=full` and returns
   one collapsed thread. Mutually exclusive with `--query` /

@@ -99,6 +99,29 @@ def _default_messages() -> List[GmailMessage]:
             attachments=(),
             label_ids=("INBOX",),
         ),
+        GmailMessage(
+            message_id="msg_5",
+            thread_id="thread_3",
+            subject="Q3 prep — actions and meeting",
+            from_="Alice Example <alice@example.invalid>",
+            to="team@example.invalid",
+            cc="",
+            date="Thu, 23 May 2026 09:00:00 +0900",
+            rfc822_message_id="<fake-005@example.invalid>",
+            snippet="A few action items and a planning meeting.",
+            body_text=(
+                "Hi team,\n\n"
+                "A few things to lock down:\n\n"
+                "Action item: Send the Q3 numbers to Alice by 2026-06-10\n"
+                "Action item: Confirm the budget freeze on 2026-06-12\n"
+                "Due: 2026-06-15\n"
+                "Meeting: Quarterly planning sync on 2026-06-18 14:00\n\n"
+                "Thanks,\nAlice"
+            ),
+            has_attachments=False,
+            attachments=(),
+            label_ids=("INBOX",),
+        ),
     ]
 
 
