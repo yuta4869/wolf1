@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>wolf · local GUI shell</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark">wolf</span>
+      <span class="brand-tag">local GUI shell · v0.3 dev</span>
+    </div>
+    <nav class="navtabs" id="navtabs">
+      <button data-tab="command" class="active">Command</button>
+      <button data-tab="settings">Settings</button>
+      <button data-tab="files">Files</button>
+      <button data-tab="mail">Mail</button>
+      <button data-tab="gmail">Gmail</button>
+      <button data-tab="audit">Audit</button>
+      <button data-tab="avatar">Avatar</button>
+    </nav>
+    <div class="health"><span id="health-pill">…</span></div>
+  </header>
+
+  <main>
+    <!-- Command -->
+    <section class="panel active" data-panel="command">
+      <h2>Command</h2>
+      <p class="hint">
+        Pick one of the allowlisted commands and fill in the
+        arguments. The browser sends a JSON payload to
+        <code>/api/command</code>; the server re-enters the existing
+        CLI handler. No shell, no subprocess.
+      </p>
+      <div class="row">
+        <label>Command
+          <select id="cmd-select">
+            <option value="search-files">search-files</option>
+            <option value="summarize-file">summarize-file</option>
+            <option value="search-summarize">search-summarize</option>
+            <option value="mail-search">mail-search</option>
+            <option value="mail-summarize">mail-summarize</option>
+            <option value="mail-thread">mail-thread</option>
+            <option value="mail-search-summarize">mail-search-summarize</option>
+            <option value="gmail-search">gmail-search</option>
+            <option value="gmail-read">gmail-read</option>
+            <option value="gmail-thread">gmail-thread</option>
+            <option value="gmail-summarize">gmail-summarize</option>
+            <option value="gmail-search-summarize">gmail-search-summarize</option>
+            <option value="audit-tail">audit-tail</option>
+          </select>
+        </label>
+        <button id="cmd-run">Run</button>
+      </div>
+      <div id="cmd-args" class="argbox"></div>
+      <h3>Result</h3>
+      <pre id="cmd-result" class="result"></pre>
+      <h3 class="muted">stderr</h3>
+      <pre id="cmd-stderr" class="result muted"></pre>
+    </section>
+
+    <!-- Settings -->
+    <section class="panel" data-panel="settings">
+      <h2>Settings</h2>
+      <p class="hint">
+        Stored at <code>.wolf/config/settings.json</code> under the
+        current project root. Tokens / access_token / refresh_token
+        / client_secret / api_key are <strong>rejected</strong> by
+        the server.
+      </p>
+      <div id="settings-form" class="form"></div>
+      <button id="settings-save">Save</button>
+      <pre id="settings-status" class="result"></pre>
+    </section>
+
+    <!-- Files -->
+    <section class="panel" data-panel="files">
+      <h2>Files</h2>
+      <p class="hint">
+        Entry points for the v0.1 file commands. Paths must live
+        under <code>--project-root</code>; secrets / .env /
+        credentials / tokens / private are denied by the
+        SensitivePathGuard.
+      </p>
+      <div class="quick">
+        <button data-cmd="summarize-file" data-key="path">summarize-file (path…)</button>
+        <button data-cmd="search-files" data-key="query">search-files (query…)</button>
+        <button data-cmd="search-summarize" data-key="query">search-summarize (query…)</button>
+      </div>
+    </section>
+
+    <!-- Mail -->
+    <section class="panel" data-panel="mail">
+      <h2>Mail</h2>
+      <p class="hint">
+        Local .eml / .mbox / Maildir. Never sends. Drafts are
+        returned as text the user copies into their real client.
+      </p>
+      <div class="quick">
+        <button data-cmd="mail-search" data-key="path">mail-search (path…)</button>
+        <button data-cmd="mail-summarize" data-key="path">mail-summarize (path…)</button>
+        <button data-cmd="mail-thread" data-key="path">mail-thread (path…)</button>
+        <button data-cmd="mail-search-summarize" data-key="path">mail-search-summarize (path…)</button>
+      </div>
+    </section>
+
+    <!-- Gmail -->
+    <section class="panel" data-panel="gmail">
+      <h2>Gmail</h2>
+      <p class="hint">
+        Default backend is <code>fake</code> (no network). Real Gmail
+        requires a <code>credentials_path</code> JSON file with
+        <code>{"access_token": "..."}</code> — wolf never refreshes
+        the token and never sends mail.
+      </p>
+      <div class="quick">
+        <button data-cmd="gmail-search" data-key="query">gmail-search (query…)</button>
+        <button data-cmd="gmail-read" data-key="message_id">gmail-read (message_id…)</button>
+        <button data-cmd="gmail-thread" data-key="thread_id">gmail-thread (thread_id…)</button>
+        <button data-cmd="gmail-summarize" data-key="query">gmail-summarize (query…)</button>
+        <button data-cmd="gmail-search-summarize" data-key="query">gmail-search-summarize (query…)</button>
+      </div>
+    </section>
+
+    <!-- Audit -->
+    <section class="panel" data-panel="audit">
+      <h2>Audit</h2>
+      <p class="hint">
+        Live tail of <code>var/audit/audit.jsonl</code> via
+        <code>/api/audit-tail</code>. The CLI handler is the source
+        of truth — body bytes and tokens are never re-injected here.
+      </p>
+      <div class="row">
+        <label>limit
+          <input type="number" id="audit-limit" value="20" min="1" max="200" />
+        </label>
+        <label>action_kind
+          <input type="text" id="audit-kind" placeholder="e.g. gmail.search" />
+        </label>
+        <button id="audit-reload">Reload</button>
+      </div>
+      <pre id="audit-result" class="result"></pre>
+    </section>
+
+    <!-- Avatar -->
+    <section class="panel" data-panel="avatar">
+      <h2>Avatar</h2>
+      <p class="hint">
+        Placeholder panel. The avatar engine, camera input,
+        microphone input, WebRTC streaming, and robot avatar are
+        intentionally NOT implemented yet (PR #31 is GUI shell only).
+      </p>
+      <div id="avatar-state" class="result"></div>
+      <ul class="todo">
+        <li>future: Live2D / VRM model load</li>
+        <li>future: lip-sync / pose feed</li>
+        <li>future: robot mirror via LiderFlower transport</li>
+        <li>future: hard human-override gate (CLAUDE.md §5)</li>
+      </ul>
+    </section>
+  </main>
+
+  <footer>
+    <span class="footer-info">
+      Bound to <span id="footer-host">…</span>. Local-only by default.
+      Audit covers every <code>gui.command</code> call (metadata only).
+    </span>
+  </footer>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

@@ -4466,5 +4466,49 @@ class AuditTailCliTest(unittest.TestCase):
         self.assertNotIn("Bearer ", out)
 
 
+class GuiCliTest(unittest.TestCase):
+    """gui subcommand parser + dispatch (PR #31)."""
+
+    def setUp(self) -> None:
+        self.fixture = _ProjectFixture()
+
+    def tearDown(self) -> None:
+        self.fixture.cleanup()
+
+    def test_help_runs(self) -> None:
+        # `wolf gui --help` should be self-contained and exit 0.
+        out_buf = io.StringIO()
+        err_buf = io.StringIO()
+        with self.assertRaises(SystemExit) as ctx:
+            from contextlib import redirect_stdout, redirect_stderr
+            with redirect_stdout(out_buf), redirect_stderr(err_buf):
+                from wolf.cli import build_parser
+                build_parser().parse_args(["gui", "--help"])
+        self.assertEqual(ctx.exception.code, 0)
+        self.assertIn("Bind host", out_buf.getvalue())
+
+    def test_non_loopback_without_allow_lan_exits_two(self) -> None:
+        code, _out, err = _run_inproc(
+            [
+                "--project-root", str(self.fixture.root),
+                "gui", "--host", "0.0.0.0", "--port", "0",
+            ]
+        )
+        self.assertEqual(code, EXIT_DENIED)
+        self.assertIn("loopback", err)
+
+    def test_invalid_port_internal_error(self) -> None:
+        # Port -1 is below the socket range. The cli's catch-all
+        # handler returns EXIT_INTERNAL_ERROR; specific exit code
+        # is implementation detail, but it must NOT bind.
+        code, _out, _err = _run_inproc(
+            [
+                "--project-root", str(self.fixture.root),
+                "gui", "--port", "-1",
+            ]
+        )
+        self.assertNotEqual(code, EXIT_SUCCESS)
+
+
 if __name__ == "__main__":
     unittest.main()

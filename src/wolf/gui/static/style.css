@@ -1,0 +1,218 @@
+:root {
+  --bg: #f7f8fa;
+  --panel: #ffffff;
+  --ink: #1d2433;
+  --muted: #6b7388;
+  --accent: #5b6dff;
+  --line: #e1e4ec;
+  --warn: #d63b53;
+  --ok: #1b9c63;
+  --code-bg: #f1f3f9;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14161c;
+    --panel: #1c1f29;
+    --ink: #e6e8f2;
+    --muted: #8d93a8;
+    --accent: #8da0ff;
+    --line: #2a2e3c;
+    --warn: #ff7892;
+    --ok: #4bd49a;
+    --code-bg: #232633;
+  }
+}
+
+* { box-sizing: border-box; }
+html, body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 14px/1.5 -apple-system, BlinkMacSystemFont, "SF Pro Text",
+        "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 12px 18px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+  position: sticky;
+  top: 0;
+  z-index: 2;
+}
+.brand-mark {
+  font-weight: 700;
+  letter-spacing: 0.2px;
+  font-size: 16px;
+}
+.brand-tag {
+  margin-left: 10px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.navtabs {
+  display: flex;
+  gap: 6px;
+  flex: 1;
+}
+.navtabs button {
+  background: transparent;
+  color: var(--ink);
+  border: 1px solid transparent;
+  padding: 6px 10px;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 13px;
+}
+.navtabs button.active {
+  background: var(--accent);
+  color: #fff;
+}
+.navtabs button:hover:not(.active) {
+  background: var(--code-bg);
+}
+
+.health {
+  font-size: 12px;
+  color: var(--muted);
+}
+#health-pill.ok { color: var(--ok); }
+#health-pill.bad { color: var(--warn); }
+
+main {
+  max-width: 980px;
+  margin: 20px auto;
+  padding: 0 16px;
+}
+
+.panel {
+  display: none;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 18px;
+  margin-bottom: 16px;
+}
+.panel.active { display: block; }
+.panel h2 { margin: 0 0 6px 0; font-size: 18px; }
+.panel h3 { margin: 18px 0 6px 0; font-size: 14px; color: var(--muted); }
+
+.hint {
+  color: var(--muted);
+  font-size: 13px;
+  margin: 4px 0 14px 0;
+}
+.hint code, code {
+  background: var(--code-bg);
+  padding: 1px 5px;
+  border-radius: 4px;
+  font: 12px ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.row {
+  display: flex;
+  align-items: end;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+.row label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.row input, .row select, .argbox input, .argbox select, .form input, .form select {
+  background: var(--code-bg);
+  color: var(--ink);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 6px 8px;
+  font-size: 13px;
+  min-width: 200px;
+}
+button {
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  padding: 7px 14px;
+  cursor: pointer;
+  font-size: 13px;
+}
+button:hover { filter: brightness(1.05); }
+
+.argbox {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: 1fr 1fr;
+  margin-top: 4px;
+}
+.argbox label {
+  display: flex;
+  flex-direction: column;
+  font-size: 12px;
+  color: var(--muted);
+  gap: 4px;
+}
+
+.result {
+  background: var(--code-bg);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px;
+  font: 12px ui-monospace, SFMono-Regular, Menlo, monospace;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 360px;
+  overflow: auto;
+}
+.result.muted { color: var(--muted); }
+
+.quick {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  align-items: flex-start;
+}
+.quick button {
+  background: var(--code-bg);
+  color: var(--ink);
+  border: 1px solid var(--line);
+}
+
+.form {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: 1fr 1fr;
+  margin: 10px 0;
+}
+.form label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.todo {
+  margin: 8px 0 0 0;
+  padding-left: 16px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+footer {
+  text-align: center;
+  color: var(--muted);
+  font-size: 11px;
+  padding: 12px 0 30px 0;
+}
+.footer-info code {
+  font-size: 11px;
+}

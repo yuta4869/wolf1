@@ -10,6 +10,15 @@ shipped after PR #1 through PR #21.
 
 ## v0.3 in progress
 
+- **Local GUI shell** (PR #31): a stdlib-only `http.server` on
+  127.0.0.1:8765 that exposes the existing CLI surface as an
+  allowlisted JSON API plus a tiny vanilla-JS browser UI.
+  Default bind is loopback; `--allow-lan` is required for any
+  non-loopback host. No Flask / FastAPI / Electron / React. No
+  authentication. No camera / microphone / WebRTC. Avatar panel
+  is a placeholder. Launch with
+  `python3 -m wolf.cli gui --open-browser`. See
+  [`docs/usage/gui.md`](docs/usage/gui.md).
 - **Task / calendar extraction** (PR #30): pull task and
   calendar-event candidates out of local mail or Gmail, and
   emit a draft iCalendar (`.ics`) file. CLI:
