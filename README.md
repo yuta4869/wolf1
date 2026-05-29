@@ -8,6 +8,18 @@ runs them through a small safety pipeline, and uses a local LLM
 This README documents the **v0.1** release scope. It is what is
 shipped after PR #1 through PR #21.
 
+## v0.3 in progress
+
+- **Task / calendar extraction** (PR #30): pull task and
+  calendar-event candidates out of local mail or Gmail, and
+  emit a draft iCalendar (`.ics`) file. CLI:
+  `task-extract-mail` / `task-extract-gmail` /
+  `calendar-draft-mail` / `calendar-draft-gmail`. No Google
+  Calendar API integration. No `gmail.send`. The CLI
+  produces candidates and `.ics` text; the user moves them
+  into a real calendar by hand. See
+  [`docs/usage/tasks.md`](docs/usage/tasks.md).
+
 ## v0.2.0 — local + Gmail mail workflows
 
 `v0.2.0` is the second feature wave on top of the v0.1 safety

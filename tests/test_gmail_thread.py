@@ -39,12 +39,17 @@ class ThreadIdGroupingTest(unittest.TestCase):
         self.messages = FakeGmailClient().messages
 
     def test_two_threads(self) -> None:
-        # The fake fixture has thread_1 (planning, 2 msgs) and thread_2
-        # (snacks, 2 msgs).
+        # The fake fixture has at least:
+        #   thread_1 (planning, 2 msgs), thread_2 (snacks, 2 msgs).
+        # PR #30 added thread_3 (task markers, 1 msg). Assert that
+        # both thread_1 and thread_2 are present rather than the
+        # exact thread count, so future fixture additions don't
+        # need a test edit.
         ts = build_threads(self.messages)
-        self.assertEqual(len(ts), 2)
         ids = {t.thread_id for t in ts}
-        self.assertEqual(ids, {"thread_1", "thread_2"})
+        self.assertIn("thread_1", ids)
+        self.assertIn("thread_2", ids)
+        self.assertGreaterEqual(len(ts), 2)
 
     def test_thread_1_grouping(self) -> None:
         ts = build_threads(self.messages)

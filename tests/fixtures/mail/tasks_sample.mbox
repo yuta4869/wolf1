@@ -1,0 +1,31 @@
+From alice@example.invalid Tue May 21 09:00:00 2026
+From: Alice Example <alice@example.invalid>
+To: team@example.invalid
+Subject: Q3 prep — actions and meeting
+Date: Tue, 21 May 2026 09:00:00 +0900
+Message-ID: <tasks-mbox-001@example.invalid>
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+
+Hi team,
+
+Action item: Send the Q3 numbers to Alice by 2026-06-10
+Meeting: Quarterly planning sync on 2026-06-18 14:00
+
+Thanks,
+Alice
+
+From bob@example.invalid Tue May 21 11:00:00 2026
+From: Bob Example <bob@example.invalid>
+To: alice@example.invalid
+Subject: Re: Q3 prep — actions and meeting
+Date: Tue, 21 May 2026 11:00:00 +0900
+Message-ID: <tasks-mbox-002@example.invalid>
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+
+Action item: Bob to write up Q2 retrospective by 2026-06-13
+Meeting: retro debrief on 2026-06-14
+
+Bob
+

@@ -264,12 +264,18 @@ def _parsed_from_message(
     *,
     max_bytes: int,
 ) -> ParsedMail:
-    subject = msg.get("Subject", "") or ""
-    from_ = msg.get("From", "") or ""
-    to = msg.get("To", "") or ""
-    cc = msg.get("Cc", "") or ""
-    date = msg.get("Date", "") or ""
-    message_id = msg.get("Message-ID", "") or msg.get("Message-Id", "") or ""
+    # Coerce header values to str. For unusual encodings (e.g. a
+    # Subject containing a U+2014 em-dash) the stdlib email module
+    # may return an `email.header.Header` instance instead of a plain
+    # str, which then breaks downstream .strip() calls.
+    subject = str(msg.get("Subject", "") or "")
+    from_ = str(msg.get("From", "") or "")
+    to = str(msg.get("To", "") or "")
+    cc = str(msg.get("Cc", "") or "")
+    date = str(msg.get("Date", "") or "")
+    message_id = str(
+        msg.get("Message-ID", "") or msg.get("Message-Id", "") or ""
+    )
     in_reply_to = _extract_message_id_list(msg.get("In-Reply-To", "") or "")
     references = _extract_message_id_list(msg.get("References", "") or "")
     body, content_type, has_attachments, attachments = _extract_body(
