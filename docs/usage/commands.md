@@ -443,6 +443,28 @@ Key flags: as `task-extract-gmail` plus
 `--output {json,text,ics}` and
 `--output-file PATH`.
 
+### `gui` (PR #31)
+
+Launch the local GUI shell. Stdlib `http.server` on
+**127.0.0.1:8765** by default; non-loopback host requires
+`--allow-lan`. No external dependencies, no authentication.
+
+```sh
+python -m wolf.cli gui [--host HOST] [--port PORT]
+                       [--open-browser] [--allow-lan] [--log-stderr]
+# Equivalent shortcut:
+python -m wolf.gui
+```
+
+Key flags: `--host HOST` (default `127.0.0.1`), `--port PORT`
+(default `8765`; pass `0` for an ephemeral port), `--open-browser`
+(open the bound URL in the system browser), `--allow-lan`
+(required to bind a non-loopback host), `--log-stderr` (stream
+the stdlib http access log to stderr). Launch writes one
+`gui.launch` audit event; each `POST /api/command` writes one
+`gui.command` event. See [gui.md](gui.md) for the API surface,
+panel inventory, and security posture.
+
 ### `audit-tail` (PR #29)
 
 Re-print the last N events from `var/audit/audit.jsonl`. The

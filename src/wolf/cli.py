@@ -4946,6 +4946,79 @@ def cmd_audit_tail(args: argparse.Namespace) -> int:
     return EXIT_SUCCESS
 
 
+def cmd_gui(args: argparse.Namespace) -> int:
+    """Launch the local GUI shell (stdlib http.server, 127.0.0.1)."""
+    import webbrowser
+
+    from .gui.server import (
+        DEFAULT_HOST as GUI_DEFAULT_HOST,
+        DEFAULT_PORT as GUI_DEFAULT_PORT,
+        build_server,
+        serve_forever,
+    )
+
+    project_root = Path(args.project_root).resolve()
+    host = getattr(args, "host", None) or GUI_DEFAULT_HOST
+    port = int(getattr(args, "port", None) or GUI_DEFAULT_PORT)
+    allow_lan = bool(getattr(args, "allow_lan", False))
+
+    try:
+        server = build_server(
+            host=host,
+            port=port,
+            project_root=project_root,
+            allow_lan=allow_lan,
+            log_to_stderr=bool(getattr(args, "log_stderr", False)),
+        )
+    except ValueError as exc:
+        sys.stderr.write(f"wolf cli: {exc}\n")
+        return EXIT_DENIED
+    except OSError as exc:
+        sys.stderr.write(
+            f"wolf cli: gui bind failed ({type(exc).__name__}): {exc}\n"
+        )
+        return EXIT_DENIED
+
+    actual_host, actual_port = server.server_address[0], server.server_address[1]
+    url = f"http://{actual_host}:{actual_port}/"
+    sys.stdout.write(f"wolf GUI: {url}\n")
+    sys.stdout.write("Press Ctrl+C to stop.\n")
+    sys.stdout.flush()
+
+    # Audit the launch (metadata only).
+    try:
+        from .core.audit import utc_now_iso
+        from .core.types import AuditEvent
+
+        audit = AuditLogger(_default_audit_path(project_root))
+        audit.log(
+            AuditEvent(
+                ts=utc_now_iso(),
+                actor="cli:gui",
+                action_kind="gui.launch",
+                decision="allow",
+                target=f"gui:{actual_host}:{actual_port}",
+                outcome="launched",
+                detail={
+                    "host": actual_host,
+                    "port": int(actual_port),
+                    "allow_lan": allow_lan,
+                },
+            )
+        )
+    except OSError:
+        pass
+
+    if getattr(args, "open_browser", False):
+        try:
+            webbrowser.open(url)
+        except Exception:  # noqa: BLE001
+            pass
+
+    serve_forever(server)
+    return EXIT_SUCCESS
+
+
 def cmd_check_path(args: argparse.Namespace) -> int:
     project_root = Path(args.project_root).resolve()
     router = _build_router(project_root)
@@ -6354,6 +6427,42 @@ def build_parser() -> argparse.ArgumentParser:
         "--output", choices=("json", "text"), default="json",
     )
     at.set_defaults(func=cmd_audit_tail)
+
+    # gui (PR #31)
+    gu = sub.add_parser(
+        "gui",
+        help=(
+            "Launch the local GUI shell (stdlib http.server). "
+            "Default bind 127.0.0.1:8765. Local-only by default."
+        ),
+    )
+    gu.add_argument(
+        "--host", default=None,
+        help="Bind host (default: 127.0.0.1). Non-loopback requires --allow-lan.",
+    )
+    gu.add_argument(
+        "--port", type=int, default=None,
+        help="Bind port (default: 8765). Pass 0 to let the OS pick.",
+    )
+    gu.add_argument(
+        "--open-browser",
+        action="store_true",
+        help="Open the GUI URL in the system browser after binding.",
+    )
+    gu.add_argument(
+        "--allow-lan",
+        action="store_true",
+        help=(
+            "Required for any non-loopback --host (incl. 0.0.0.0). "
+            "Opens the GUI to the local network — there is no auth."
+        ),
+    )
+    gu.add_argument(
+        "--log-stderr",
+        action="store_true",
+        help="Stream the stdlib http access log to stderr.",
+    )
+    gu.set_defaults(func=cmd_gui)
 
     cp = sub.add_parser(
         "check-path",

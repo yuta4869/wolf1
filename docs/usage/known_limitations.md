@@ -125,6 +125,24 @@ documented as out of scope.
   deterministic regex over `Action item:` / `Due:` /
   `Meeting:` lines with ISO dates. Free-form
   "next Thursday at 3pm" is not picked up by the fallback.
+- **GUI shell is single-user, single-machine, no auth.**
+  PR #31's `wolf gui` defaults to 127.0.0.1:8765. Non-loopback
+  binding requires `--allow-lan`, but there is still no
+  authentication, no CSRF token, and no rate limiting. Do not
+  open it on a shared LAN unless you understand that anyone on
+  the network can drive `/api/command` and trigger Gmail /
+  Ollama / file operations from the bound project root.
+- **GUI command allowlist excludes mutating commands.** PR #31
+  intentionally omits `mail-draft`, `gmail-draft`,
+  `index-files`, `task-extract-*`, `calendar-draft-*`, and
+  `robot-preflight` from `/api/command`. Use the CLI directly
+  for those. Read commands and `audit-tail` are reachable.
+- **GUI is single-threaded.** Stdlib `HTTPServer` processes one
+  request at a time. Long Ollama summaries visibly block the
+  browser; that is expected.
+- **GUI Avatar panel is a placeholder.** No engine, no camera,
+  no microphone, no WebRTC, no robot avatar bridge. Do not
+  rely on any of those words in the UI implying functionality.
 - **`gmail-thread --thread-id` is a single GET.** The
   command fetches `GET /threads/{id}?format=full` and returns
   one collapsed thread. Mutually exclusive with `--query` /
